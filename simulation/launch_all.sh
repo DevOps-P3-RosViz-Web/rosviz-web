@@ -90,7 +90,8 @@ echo "  ros_gz_bridge running (PID: $BRIDGE_PID)"
 
 # 3. Image compressor (raw → JPEG for the browser)
 echo "[3/6] Starting image compressor..."
-python3 "$PROJECT_DIR/scripts/image_compressor.py" &
+# python3 "$PROJECT_DIR/scripts/image_compressor.py" &
+NUM_ROBOTS=$NUM_ROBOTS python3 "$PROJECT_DIR/scripts/image_compressor.py" &
 COMPRESSOR_PID=$!
 sleep 1
 echo "  Image compressor running (PID: $COMPRESSOR_PID)"
