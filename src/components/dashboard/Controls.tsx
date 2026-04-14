@@ -25,6 +25,7 @@ import {
   Battery
 } from 'lucide-react';
 import { useROS } from '@/hooks/useROS';
+import { resolveRobotTopic } from '@/lib/robot-topics';
 
 interface Waypoint {
   id: string;
@@ -57,7 +58,11 @@ interface SupplyMessage {
   current?: number[];
 }
 
-export default function Controls() {
+interface ControlsProps {
+  robotId: string;
+}
+
+export default function Controls({ robotId }: ControlsProps) {
   const [waypoints, setWaypoints] = useState<Waypoint[]>([
     { id: '1', lat: "40.7128", lng: "-74.0060", label: "Point A" },
     { id: '2', lat: "40.7580", lng: "-73.9855", label: "Point B" }
@@ -118,7 +123,7 @@ export default function Controls() {
     if (!isConnected) return;
     
     setCurrentTwist(twist);
-    publish('/cmd_vel', 'geometry_msgs/Twist', twist);
+    publish(resolveRobotTopic(robotId, '/cmd_vel'), 'geometry_msgs/Twist', twist);
   };
   
   // Stop movement
@@ -236,7 +241,7 @@ export default function Controls() {
   useEffect(() => {
     if (!isConnected) return;
     
-    const batteryUnsubscribe = subscribe<any>('/battery_state', 'sensor_msgs/BatteryState', (message) => {
+    const batteryUnsubscribe = subscribe<any>(resolveRobotTopic(robotId, '/battery_state'), 'sensor_msgs/BatteryState', (message) => {
       if (message && message.percentage !== undefined) {
         setBatteryLevel(message.percentage * 100);
       } else if (message && message.voltage !== undefined) {
@@ -249,7 +254,7 @@ export default function Controls() {
     return () => {
       batteryUnsubscribe();
     };
-  }, [isConnected, subscribe]);
+  }, [isConnected, subscribe, robotId]);
   
   // Cleanup effect to ensure we stop sending commands when component unmounts
   useEffect(() => {

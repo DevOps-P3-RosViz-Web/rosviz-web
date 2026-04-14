@@ -112,9 +112,9 @@ Open separate terminals for each (or use the provided launch script):
 
 ```bash
 source /opt/ros/humble/setup.bash
-export IGN_GAZEBO_RESOURCE_PATH=<path-to>/simulation/models
+export IGN_GAZEBO_RESOURCE_PATH=<path-to>/simulation/models/generated
 
-ign gazebo -s -r <path-to>/simulation/worlds/turtlebot3_world.sdf
+ign gazebo -s -r <path-to>/simulation/worlds/generated/turtlebot3_world.sdf
 ```
 
 **Terminal 2 — ros_gz_bridge**
@@ -190,9 +190,11 @@ rosviz-web/
 ├── simulation/
 │   ├── launch_all.sh            # One-command launcher for full stack
 │   ├── models/
-│   │   └── turtlebot3_waffle/   # Ignition Gazebo SDF model
+│   │   ├── templates/turtlebot3_waffle/  # Base model template
+│   │   └── generated/                    # Per-robot generated models
 │   └── worlds/
-│       └── turtlebot3_world.sdf # World with walls, obstacles, robot
+│       ├── templates/turtlebot3_world.sdf  # Base world template
+│       └── generated/                      # Generated world files
 ├── src/
 │   ├── components/dashboard/    # React dashboard components
 │   │   ├── Controls.tsx         # D-pad, waypoints, emergency stop

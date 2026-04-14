@@ -1,14 +1,13 @@
 'use client';
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
-import { 
+import {
   Navigation, 
   Gauge,
-  Crosshair,
-  RadioTower,
   MoveDiagonal
 } from 'lucide-react';
 import { useROS } from '@/hooks/useROS';
+import { resolveRobotTopic } from '@/lib/robot-topics';
 
 interface TelemetryData {
   altitude: number;
@@ -22,7 +21,11 @@ interface TelemetryData {
   distanceFromHome: number;
 }
 
-const VideoFeed = () => {
+interface VideoFeedProps {
+  robotId: string;
+}
+
+const VideoFeed = ({ robotId }: VideoFeedProps) => {
   const [telemetry, setTelemetry] = useState<TelemetryData>({
     altitude: 0,
     heading: 0,
@@ -192,7 +195,7 @@ const VideoFeed = () => {
     // Video feed subscription with performance optimizations
     if (isConnected) {
       unsubscribers.push(
-        subscribe('/camera/image_raw/compressed', 'sensor_msgs/CompressedImage', (message: any) => {
+        subscribe(resolveRobotTopic(robotId, '/camera/image_raw/compressed'), 'sensor_msgs/CompressedImage', (message: any) => {
           try {
             // Skip if already processing a frame or if it's too soon
             if (processingFrame.current) return;
@@ -230,7 +233,7 @@ const VideoFeed = () => {
 
     // Combined telemetry subscription with aggressive throttling
     unsubscribers.push(
-      subscribe('/odom', 'nav_msgs/Odometry', (message: any) => {
+      subscribe(resolveRobotTopic(robotId, '/odom'), 'nav_msgs/Odometry', (message: any) => {
         const now = performance.now();
         if (now - lastTelemetryUpdate.current < TELEMETRY_UPDATE_INTERVAL) {
           return;
@@ -275,7 +278,7 @@ const VideoFeed = () => {
       unsubscribers.forEach(unsub => unsub());
       cancelAnimationFrame(animationFrameId.current);
     };
-  }, [subscribe, isConnected, renderFrame]);
+  }, [subscribe, isConnected, renderFrame, robotId]);
 
   return (
     <div className="w-full h-full bg-black rounded-sm relative overflow-hidden">

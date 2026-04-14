@@ -12,6 +12,8 @@ import {
   ExternalLink
 } from 'lucide-react';
 import Link from 'next/link';
+import { useROS } from '@/hooks/useROS';
+import { extractRobotIdsFromTopics } from '@/lib/robot-topics';
 
 const TelemetryPanel = dynamic(
   () => import('./TelemetryPanel'),
@@ -65,6 +67,36 @@ export default function DashboardClient() {
   const mainSplitRef = useRef(null);
   const leftSplitRef = useRef(null);
   const [activeTab, setActiveTab] = useState('dashboard');
+  const [robotIds, setRobotIds] = useState<string[]>([]);
+  const [selectedRobotId, setSelectedRobotId] = useState(process.env.NEXT_PUBLIC_DEFAULT_ROBOT_ID ?? '');
+  const { isConnected, listTopics } = useROS({ url: 'ws://localhost:9090', autoConnect: true });
+  const activeRobotId = selectedRobotId || robotIds[0] || '';
+
+  useEffect(() => {
+    if (!isConnected) return;
+
+    let canceled = false;
+    const refreshRobotIds = async () => {
+      try {
+        const topics = await listTopics();
+        const discovered = extractRobotIdsFromTopics(topics);
+        if (canceled || discovered.length === 0) return;
+
+        setRobotIds(discovered);
+        setSelectedRobotId(prev => (discovered.includes(prev) ? prev : discovered[0]));
+      } catch (error) {
+        console.warn('Failed to discover robot IDs:', error);
+      }
+    };
+
+    refreshRobotIds();
+    const intervalId = setInterval(refreshRobotIds, 3000);
+
+    return () => {
+      canceled = true;
+      clearInterval(intervalId);
+    };
+  }, [isConnected, listTopics]);
 
   useEffect(() => {
     let mainSplit: Split.Instance;
@@ -156,6 +188,21 @@ export default function DashboardClient() {
           </Button>
         </div>
         <div className="flex-1" />
+        <div className="flex items-center gap-2 mr-3">
+          <span className="text-gray-400 text-xs">Robot</span>
+          <select
+            className="bg-[#2a2a2a] text-gray-200 text-xs rounded px-2 py-1 border border-[#3a3a3a]"
+            value={activeRobotId}
+            disabled={robotIds.length === 0 && !activeRobotId}
+            onChange={(event) => setSelectedRobotId(event.target.value)}
+          >
+            {(robotIds.length > 0 ? robotIds : activeRobotId ? [activeRobotId] : []).map((robotId) => (
+              <option key={robotId} value={robotId}>
+                {robotId}
+              </option>
+            ))}
+          </select>
+        </div>
         <span className="text-gray-400 text-sm">TurtleBot3 Control System</span>
       </div>
 
@@ -170,7 +217,7 @@ export default function DashboardClient() {
                   <span className="text-gray-400">Loading...</span>
                 </div>
               }>
-                <VideoGrid />
+                <VideoGrid robotIds={robotIds.length > 0 ? robotIds : activeRobotId ? [activeRobotId] : []} />
               </Suspense>
             </div>
             
@@ -180,7 +227,11 @@ export default function DashboardClient() {
                   <span className="text-gray-400">Loading...</span>
                 </div>
               }>
-                <TelemetryPanel />
+                {activeRobotId ? <TelemetryPanel robotId={activeRobotId} /> : (
+                  <div className="h-full bg-[#1a1a1a] rounded-sm p-2 border border-[#2a2a2a] flex items-center justify-center">
+                    <span className="text-gray-400">Discovering robots...</span>
+                  </div>
+                )}
               </Suspense>
             </div>
           </div>
@@ -192,7 +243,11 @@ export default function DashboardClient() {
                 <span className="text-gray-400">Loading Controls...</span>
               </div>
             }>
-              <Controls />
+              {activeRobotId ? <Controls robotId={activeRobotId} /> : (
+                <div className="h-full bg-[#1e1e1e] rounded-sm flex items-center justify-center">
+                  <span className="text-gray-400">Discovering robots...</span>
+                </div>
+              )}
             </Suspense>
           </div>
         </div>
@@ -202,7 +257,7 @@ export default function DashboardClient() {
             <span className="text-gray-400">Loading Sensor Data...</span>
           </div>
         }>
-          <SensorData />
+          <SensorData robotId={activeRobotId || undefined} />
         </Suspense>
       )}
     </div>

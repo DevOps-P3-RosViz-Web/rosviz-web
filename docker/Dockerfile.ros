@@ -64,7 +64,7 @@ RUN chmod +x /ros-entrypoint.sh
 # ── Environment ──
 ENV TURTLEBOT3_MODEL=waffle
 ENV ROS_DOMAIN_ID=0
-ENV IGN_GAZEBO_RESOURCE_PATH=/ros_ws/simulation/models
+ENV IGN_GAZEBO_RESOURCE_PATH=/ros_ws/simulation/models/generated
 
 # ── Ports ──
 #  9090  rosbridge WebSocket (browser connects here)

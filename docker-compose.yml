@@ -30,7 +30,12 @@ services:
     environment:
       - TURTLEBOT3_MODEL=waffle
       - ROS_DOMAIN_ID=0
-      - IGN_GAZEBO_RESOURCE_PATH=/ros_ws/simulation/models
+      # Multi-robot config:
+      # - Set ROBOT_IDS to explicitly control namespaces (comma-separated)
+      # - Else NUM_ROBOTS generates tb3_0..tb3_(N-1)
+      - NUM_ROBOTS=3
+      # - ROBOT_IDS=tb3_0,tb3_1,tb3_2
+      - IGN_GAZEBO_RESOURCE_PATH=/ros_ws/simulation/models/generated
       # Rendering: Xvfb software mode (no GPU needed)
       - GPU_MODE=none
     ports:

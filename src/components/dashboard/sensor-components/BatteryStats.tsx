@@ -4,6 +4,7 @@ import React, { useState, useEffect } from 'react';
 import { Zap } from 'lucide-react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts';
 import { useROS } from '@/hooks/useROS';
+import { resolveRobotTopic } from '@/lib/robot-topics';
 
 interface VoltageData {
   timestamp: number;
@@ -23,7 +24,11 @@ interface BatteryStateMessage {
   present: boolean;
 }
 
-const BatteryStats = () => {
+interface BatteryStatsProps {
+  robotId: string;
+}
+
+const BatteryStats = ({ robotId }: BatteryStatsProps) => {
   const [voltage, setVoltage] = useState<number | null>(null);
   const [voltageHistory, setVoltageHistory] = useState<VoltageData[]>([]);
   const { subscribe } = useROS({ url: 'ws://localhost:9090' });
@@ -42,11 +47,11 @@ const BatteryStats = () => {
       }
     };
 
-    const unsubscribe = subscribe('/battery_state', 'sensor_msgs/BatteryState', handleBattery);
+    const unsubscribe = subscribe(resolveRobotTopic(robotId, '/battery_state'), 'sensor_msgs/BatteryState', handleBattery);
     return () => {
       unsubscribe();
     };
-  }, [subscribe]);
+  }, [subscribe, robotId]);
 
   const formatTimestamp = (timestamp: number) => {
     return new Date(timestamp).toLocaleTimeString('en-US', {

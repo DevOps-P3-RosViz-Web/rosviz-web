@@ -8,6 +8,7 @@ import URDFLoader from 'urdf-loader';
 import { useROS } from '@/hooks/useROS';
 import type { Odometry } from '@/types/ros';
 import rosbridge from '@/lib/rosbridge';
+import { resolveRobotTopic } from '@/lib/robot-topics';
 
 interface TransformMsg {
   header: {
@@ -20,7 +21,11 @@ interface TransformMsg {
   };
 }
 
-const RobotModel = () => {
+interface RobotModelProps {
+  robotId: string;
+}
+
+const RobotModel = ({ robotId }: RobotModelProps) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
   const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
@@ -91,11 +96,25 @@ const RobotModel = () => {
     try {
       console.log('[RobotModel] Loading URDF from robot_description param...');
       let paramResponse;
-      try {
-        paramResponse = await rosbridge.getParam('/robot_state_publisher:robot_description');
-      } catch {
-        console.log('[RobotModel] Trying alternate param path...');
-        paramResponse = await rosbridge.getParam('/robot_description');
+      const paramCandidates = [
+        `/${robotId}/rsp_${robotId}:robot_description`,
+        `/rsp_${robotId}:robot_description`,
+        `/${robotId}/robot_state_publisher:robot_description`,
+        '/robot_state_publisher:robot_description',
+        '/robot_description'
+      ];
+
+      for (const candidate of paramCandidates) {
+        try {
+          paramResponse = await rosbridge.getParam(candidate);
+          break;
+        } catch {
+          // Try next candidate.
+        }
+      }
+
+      if (paramResponse === undefined) {
+        throw new Error(`Could not find robot_description for ${robotId}`);
       }
       console.log('[RobotModel] Param response type:', typeof paramResponse);
 
@@ -333,7 +352,7 @@ const RobotModel = () => {
         controlsRef.current.dispose();
       }
     };
-  }, [delayComplete]);
+  }, [delayComplete, robotId]);
 
   const checkRobotVisibility = () => {
     const baseLinkGroup = linkGroupsRef.current['base_link'];
@@ -351,7 +370,7 @@ const RobotModel = () => {
     if (!delayComplete) return;
 
     const unsubscribeOdom = subscribe<Odometry>(
-      '/odom',
+      resolveRobotTopic(robotId, '/odom'),
       'nav_msgs/Odometry',
       (message) => {
         // Update the UI display only
@@ -361,18 +380,30 @@ const RobotModel = () => {
 
     // Let TF handle all the model updates
     const unsubscribeTF = subscribe<{ transforms: TransformMsg[] }>(
-      '/tf',
+      resolveRobotTopic(robotId, '/tf'),
       'tf2_msgs/TFMessage',
       (message) => {
         const tfUpdates: Record<string, boolean> = {};
+
+        const normalizeFrame = (frame: string): string => {
+          const trimmed = frame.startsWith('/') ? frame.slice(1) : frame;
+          const nsPrefix = `${robotId}/`;
+          if (trimmed.startsWith(nsPrefix)) {
+            return trimmed.slice(nsPrefix.length);
+          }
+          return trimmed;
+        };
         
         message.transforms.forEach(transform => {
+          const childFrame = normalizeFrame(transform.child_frame_id);
+          const parentFrame = normalizeFrame(transform.header.frame_id);
+
           // Skip duplicate updates for the same child frame
-          if (tfUpdates[transform.child_frame_id]) return;
-          tfUpdates[transform.child_frame_id] = true;
+          if (tfUpdates[childFrame]) return;
+          tfUpdates[childFrame] = true;
           
-          const parentGroup = linkGroupsRef.current[transform.header.frame_id];
-          const childGroup = linkGroupsRef.current[transform.child_frame_id];
+          const parentGroup = linkGroupsRef.current[parentFrame];
+          const childGroup = linkGroupsRef.current[childFrame];
           
           if (parentGroup && childGroup) {
             const newPos = new THREE.Vector3(
@@ -386,7 +417,7 @@ const RobotModel = () => {
               childGroup.position.copy(newPos);
               
               // Keep track of base_link position for telemetry
-              if (transform.child_frame_id === 'base_link') {
+              if (childFrame === 'base_link') {
                 lastPositionRef.current.copy(newPos);
               }
             }
@@ -406,7 +437,7 @@ const RobotModel = () => {
       unsubscribeOdom();
       unsubscribeTF();
     };
-  }, [delayComplete, subscribe]);
+  }, [delayComplete, subscribe, robotId]);
 
   return (
     <div className="relative w-full h-full bg-[#1a1a1a] overflow-hidden">

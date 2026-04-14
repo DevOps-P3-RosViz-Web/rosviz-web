@@ -120,7 +120,7 @@ class ROSBridge extends EventEmitter {
     this.ws.send(JSON.stringify(message));
   }
 
-  async getParam(name: string): Promise<any> {
+  async callService(service: string, args: Record<string, unknown> = {}): Promise<any> {
     if (!this.ws || !this.connected) {
       throw new Error('Not connected to ROS');
     }
@@ -129,45 +129,52 @@ class ROSBridge extends EventEmitter {
       const id = Math.random().toString(36).substr(2, 9);
       const timeoutId = setTimeout(() => {
         this.removeAllListeners(`response:${id}`);
-        reject(new Error('Parameter request timed out'));
+        reject(new Error(`Service call timed out: ${service}`));
       }, 10000);
 
       this.once(`response:${id}`, (response: any) => {
         clearTimeout(timeoutId);
-        console.log('Parameter response:', response);
-
-        if (response.op === 'service_response') {
-          if (response.values && response.values.value) {
-            resolve(response.values.value);
-          } else {
-            reject(new Error('Parameter not found'));
-          }
-        } else if (response.op === 'param_response') {
-          if (response.value !== undefined) {
-            resolve(response.value);
-          } else {
-            reject(new Error('Parameter not found'));
-          }
-        } else {
-          reject(new Error('Invalid response format'));
+        if (response.op !== 'service_response') {
+          reject(new Error(`Invalid service response for ${service}`));
+          return;
         }
+
+        if (response.result === false) {
+          reject(new Error(`Service call failed: ${service}`));
+          return;
+        }
+
+        resolve(response.values ?? response);
       });
 
       const request = {
         op: 'call_service',
-        id: id,
-        service: '/rosapi/get_param',
-        args: { name: name }
+        id,
+        service,
+        args
       };
 
-      if (this.ws) {
-        this.ws.send(JSON.stringify(request));
-        console.log('Parameter request sent:', request);
-      } else {
-        clearTimeout(timeoutId);
-        reject(new Error('WebSocket not available'));
-      }
+      this.ws?.send(JSON.stringify(request));
     });
+  }
+
+  async getParam(name: string): Promise<any> {
+    const response = await this.callService('/rosapi/get_param', { name });
+    if (response?.value !== undefined) {
+      return response.value;
+    }
+    throw new Error('Parameter not found');
+  }
+
+  async listTopics(): Promise<string[]> {
+    const response = await this.callService('/rosapi/topics', {});
+    if (Array.isArray(response?.topics)) {
+      return response.topics;
+    }
+    if (Array.isArray(response?.value)) {
+      return response.value;
+    }
+    return [];
   }
 
   subscribe<T>(topic: string, messageType: string, callback: ROSCallback<T>): () => void {

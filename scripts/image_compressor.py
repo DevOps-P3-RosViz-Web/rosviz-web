@@ -11,20 +11,19 @@ import numpy as np
 
 
 class ImageCompressor(Node):
-    def __init__(self, num_robots):
+    def __init__(self, robot_ids):
         super().__init__('image_compressor')
         self.subs = []
         self.pubs = {}
         self.skips = {}
-        for i in range(num_robots):
-            ns = f'tb3_{i}'
+        for ns in robot_ids:
             in_topic = f'/{ns}/camera/image_raw'
             out_topic = f'/{ns}/camera/image_raw/compressed'
             self.subs.append(self.create_subscription(
                 Image, in_topic, lambda msg, n=ns: self.callback(msg, n), 1))
             self.pubs[ns] = self.create_publisher(CompressedImage, out_topic, 1)
             self.skips[ns] = 0
-        self.get_logger().info(f'Image compressor started for {num_robots} robots')
+        self.get_logger().info(f'Image compressor started for robots: {", ".join(robot_ids)}')
 
     def callback(self, msg, ns):
         # Only process every 3rd frame to reduce CPU     
@@ -59,8 +58,14 @@ class ImageCompressor(Node):
 
 def main():
     rclpy.init()
-    n = int(os.environ.get('NUM_ROBOTS', '2'))
-    node = ImageCompressor(n)
+    robot_ids_env = os.environ.get('ROBOT_IDS', '').strip()
+    if robot_ids_env:
+        robot_ids = [item.strip() for item in robot_ids_env.split(',') if item.strip()]
+    else:
+        count = int(os.environ.get('NUM_ROBOTS', '2'))
+        robot_ids = [f'tb3_{i}' for i in range(count)]
+
+    node = ImageCompressor(robot_ids)
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()

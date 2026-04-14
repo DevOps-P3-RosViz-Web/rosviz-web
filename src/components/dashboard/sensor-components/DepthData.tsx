@@ -4,6 +4,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, ResponsiveContainer } from 'recharts';
 import { Ruler, ArrowDown, TrendingUp, Focus, Maximize2 } from 'lucide-react';
 import { useROS } from '@/hooks/useROS';
+import { resolveRobotTopic } from '@/lib/robot-topics';
 
 interface DepthPoint {
   timestamp: number;
@@ -39,7 +40,11 @@ interface LaserScan {
   intensities: number[];
 }
 
-const DepthData = () => {
+interface DepthDataProps {
+  robotId: string;
+}
+
+const DepthData = ({ robotId }: DepthDataProps) => {
   const [depthData, setDepthData] = useState<DepthPoint[]>([]);
   const [stats, setStats] = useState<DepthStats>({
     currentDepth: 0,
@@ -118,9 +123,9 @@ const DepthData = () => {
       lastUpdateTimeRef.current = now;
     };
 
-    const unsubscribe = subscribe('/scan', 'sensor_msgs/LaserScan', handleScan);
+    const unsubscribe = subscribe(resolveRobotTopic(robotId, '/scan'), 'sensor_msgs/LaserScan', handleScan);
     return () => unsubscribe();
-  }, [subscribe]);
+  }, [subscribe, robotId]);
 
   return (
     <div className="w-full h-full bg-[#2a2a2a] rounded-sm p-3 flex flex-col gap-3">

@@ -4,6 +4,7 @@ import React from 'react';
 import { Button } from "@/components/ui/button";
 import { ChevronRight, Maximize2, Minimize2 } from 'lucide-react';
 import VideoStream from './VideoStream';
+import { resolveRobotTopic } from '@/lib/robot-topics';
 
 interface ViewProps {
   index: number;
@@ -54,18 +55,18 @@ const View: React.FC<ViewProps> = ({ index, topic, label, isMaximized, onMaximiz
   );
 };
 
-const VideoGrid = () => {
+interface VideoGridProps {
+  robotIds: string[];
+}
+
+const VideoGrid = ({ robotIds }: VideoGridProps) => {
   const [isMounted, setIsMounted] = React.useState(false);
   const [maximizedView, setMaximizedView] = React.useState<number | null>(null);
 
-  const views = [
-    { topic: '/camera/image_raw', label: 'RGB Camera 1' },
-    { topic: '/camera/image_raw', label: 'RGB Camera 2' },
-    { topic: '/camera/image_raw', label: 'RGB Camera 3' },
-    { topic: '/camera/image_raw', label: 'RGB Camera 4' },
-    { topic: '/camera/image_raw', label: 'RGB Camera 5' },
-    { topic: '/camera/image_raw', label: 'RGB Camera 6' }
-  ];
+  const views = robotIds.map((robotId) => ({
+    topic: resolveRobotTopic(robotId, '/camera/image_raw'),
+    label: `${robotId} RGB Camera`
+  }));
 
   React.useEffect(() => {
     setIsMounted(true);
@@ -94,6 +95,11 @@ const VideoGrid = () => {
       <div className={`${
         maximizedView !== null ? '' : 'grid grid-cols-3 grid-rows-2 gap-2'
       } h-[calc(100%-2rem)]`}>
+        {views.length === 0 && (
+          <div className="h-full w-full flex items-center justify-center text-gray-500 text-sm">
+            Discovering camera streams...
+          </div>
+        )}
         {views.map((view, index) => (
           maximizedView === null || maximizedView === index ? (
             <View

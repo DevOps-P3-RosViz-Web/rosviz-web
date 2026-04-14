@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { ChevronRight } from 'lucide-react';
 import { useROS } from '@/hooks/useROS';
 import * as THREE from 'three';
+import { resolveRobotTopic } from '@/lib/robot-topics';
 
 interface TelemetryData {
   label: string;
@@ -50,7 +51,11 @@ interface RangeMessage {
   max_range: number;
 }
 
-const TelemetryPanel = () => {
+interface TelemetryPanelProps {
+  robotId: string;
+}
+
+const TelemetryPanel = ({ robotId }: TelemetryPanelProps) => {
   const [telemetryData, setTelemetryData] = useState<TelemetryData[]>([
     {
       label: 'Position X',
@@ -291,8 +296,8 @@ const TelemetryPanel = () => {
 
     // Store topic configurations to avoid dependency on telemetryData
     const topicConfigs = new Map([
-      ['/odom', 'nav_msgs/Odometry'],
-      ['/imu', 'sensor_msgs/Imu'],
+      [resolveRobotTopic(robotId, '/odom'), 'nav_msgs/Odometry'],
+      [resolveRobotTopic(robotId, '/imu'), 'sensor_msgs/Imu'],
     ]);
 
     // Clean up existing subscriptions
@@ -303,10 +308,10 @@ const TelemetryPanel = () => {
     for (const [topic, messageType] of topicConfigs) {
       const handleMessage = (message: any) => {
         switch (topic) {
-          case '/imu':
+          case resolveRobotTopic(robotId, '/imu'):
             handleIMUUpdate(message as IMUMessage);
             break;
-          case '/odom':
+          case resolveRobotTopic(robotId, '/odom'):
             handleOdometryUpdate(message as OdometryMessage);
             break;
         }
@@ -323,7 +328,7 @@ const TelemetryPanel = () => {
       subscriptionsRef.current = [];
       isSubscribedRef.current = false;
     };
-  }, [isConnected, subscribe, handleIMUUpdate, handleOdometryUpdate, handleSonarUpdate]);
+  }, [isConnected, subscribe, handleIMUUpdate, handleOdometryUpdate, handleSonarUpdate, robotId]);
 
   const getStatusColor = (data: TelemetryData): string => {
     if (data.label === 'Status') {

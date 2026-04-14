@@ -5,6 +5,8 @@ import { Button } from "@/components/ui/button";
 import { ChevronRight } from 'lucide-react';
 import Split from 'split.js';
 import dynamic from 'next/dynamic';
+import { useROS } from '@/hooks/useROS';
+import { extractRobotIdsFromTopics } from '@/lib/robot-topics';
 
 const RobotModel = dynamic(
   () => import('./sensor-components/RobotModel'),
@@ -66,13 +68,45 @@ const BatteryStats = dynamic(
   }
 );
 
-const SensorData = () => {
+interface SensorDataProps {
+  robotId?: string;
+}
+
+const SensorData = ({ robotId }: SensorDataProps) => {
   const containerRef = useRef(null);
   const col1Ref = useRef(null);
   const col3Ref = useRef(null);
   const [shouldRenderModel, setShouldRenderModel] = useState(false);
   const [shouldRenderPointCloud, setShouldRenderPointCloud] = useState(false);
   const [initialized, setInitialized] = useState(false);
+  const [autoRobotId, setAutoRobotId] = useState(process.env.NEXT_PUBLIC_DEFAULT_ROBOT_ID ?? '');
+  const { isConnected, listTopics } = useROS({ url: 'ws://localhost:9090', autoConnect: true });
+  const resolvedRobotId = robotId ?? autoRobotId;
+
+  useEffect(() => {
+    if (robotId || !isConnected) return;
+
+    let canceled = false;
+    const refresh = async () => {
+      try {
+        const topics = await listTopics();
+        const ids = extractRobotIdsFromTopics(topics);
+        if (!canceled && ids.length > 0) {
+          setAutoRobotId(ids[0]);
+        }
+      } catch {
+        // Keep last selected/default robot id if topic discovery fails.
+      }
+    };
+
+    refresh();
+    const intervalId = setInterval(refresh, 3000);
+
+    return () => {
+      canceled = true;
+      clearInterval(intervalId);
+    };
+  }, [robotId, isConnected, listTopics]);
 
   useEffect(() => {
     // Set initial render state immediately
@@ -146,6 +180,14 @@ const SensorData = () => {
     };
   }, [initialized]);
 
+  if (!resolvedRobotId) {
+    return (
+      <div className="h-[calc(100vh-3rem)] p-4 bg-[#1a1a1a] flex items-center justify-center text-gray-400">
+        Discovering robots...
+      </div>
+    );
+  }
+
   return (
     <div className="h-[calc(100vh-3rem)] p-4 bg-[#1a1a1a]" ref={containerRef}>
       <div className="flex h-full gap-1">
@@ -160,7 +202,7 @@ const SensorData = () => {
                 </Button>
               </div>
               <div className="h-[calc(100%-2rem)]">
-                {shouldRenderModel && <RobotModel />}
+                {shouldRenderModel && <RobotModel robotId={resolvedRobotId} />}
               </div>
             </div>
           </div>
@@ -173,7 +215,7 @@ const SensorData = () => {
                 </Button>
               </div>
               <div className="h-[calc(100%-2rem)]">
-                <DepthData />
+                <DepthData robotId={resolvedRobotId} />
               </div>
             </div>
           </div>
@@ -189,7 +231,7 @@ const SensorData = () => {
               </Button>
             </div>
             <div className="h-[calc(100%-2rem)]">
-              <VideoFeed />
+              <VideoFeed robotId={resolvedRobotId} />
             </div>
           </div>
         </div>
@@ -205,7 +247,7 @@ const SensorData = () => {
                 </Button>
               </div>
               <div className="h-[calc(100%-2rem)]">
-                {shouldRenderPointCloud && <PointCloud />}
+                {shouldRenderPointCloud && <PointCloud robotId={resolvedRobotId} />}
               </div>
             </div>
           </div>
@@ -218,7 +260,7 @@ const SensorData = () => {
                 </Button>
               </div>
               <div className="h-[calc(100%-2rem)]">
-                <BatteryStats />
+                <BatteryStats robotId={resolvedRobotId} />
               </div>
             </div>
           </div>
