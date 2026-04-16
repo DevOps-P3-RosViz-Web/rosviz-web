@@ -1,4 +1,11 @@
 #!/bin/bash
+# =============================================================
+#  ROSViz Web — ROS Stack Entrypoint
+# =============================================================
+#  Launches all ROS 2 / Gazebo processes in a single container.
+#  Each process runs in the background; the script waits for all.
+#  If any process exits, the container stops.
+# =============================================================
 set -e
 source /opt/ros/humble/setup.bash
 
@@ -15,9 +22,12 @@ echo ""
 
 PIDS=()
 cleanup() {
-    echo "[entrypoint] Shutting down..."
-    for pid in "${PIDS[@]}"; do kill "$pid" 2>/dev/null || true; done
+    echo "[entrypoint] Shutting down all processes..."
+    for pid in "${PIDS[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
     wait
+    echo "[entrypoint] All processes stopped."
 }
 trap cleanup SIGINT SIGTERM EXIT
 
