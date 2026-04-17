@@ -217,7 +217,7 @@
         <topic>tb3_0/camera/image_raw</topic>
         <ignition_frame_id>camera_link</ignition_frame_id>
         <camera name="tb3_camera">
-          <camera_info_topic>camera/camera_info</camera_info_topic>
+          <camera_info_topic>tb3_0/camera/camera_info</camera_info_topic>
           <horizontal_fov>1.085595</horizontal_fov>
           <image>
             <width>640</width>
