@@ -5,9 +5,6 @@ import rosbridge from '@/lib/rosbridge';
 
 const STORAGE_KEY = 'rosviz.selectedRobotId';
 
-// IMPORTANT: this service type must match what your installed topic_tools
-// package advertises. ROS 2 Humble newer revisions use the first; older
-// use the second. Verify with: ros2 service type /mux_scan_points/select
 const MUX_SELECT_SERVICE_TYPE = 'topic_tools_interfaces/srv/MuxSelect';
 // const MUX_SELECT_SERVICE_TYPE = 'topic_tools/MuxSelect';  // older fallback
 

@@ -57,7 +57,7 @@ export default function SensorDataPage() {
             Loading...
           </div>
         }>
-          <SensorData robotId={selectedRobotId} />
+          <SensorData key={selectedRobotId} robotId={selectedRobotId} />
         </Suspense>
       )}
     </div>

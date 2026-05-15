@@ -375,7 +375,6 @@ const RobotModel: React.FC<RobotModelProps> = ({ robotId }) => {
         const tfUpdates: Record<string, boolean> = {};
 
         message.transforms.forEach(transform => {
-          // Only process transforms whose child frame belongs to THIS robot.
           if (!transform.child_frame_id.startsWith(prefix)) return;
 
           if (tfUpdates[transform.child_frame_id]) return;
