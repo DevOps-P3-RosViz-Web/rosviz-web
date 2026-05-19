@@ -4,7 +4,6 @@ import React, { useEffect, useState, useRef } from "react";
 import L, { LatLngTuple } from "leaflet";
 import "leaflet/dist/leaflet.css";
 import { MapContainer, TileLayer, Marker, Popup, Polyline, useMap } from "react-leaflet";
-import rosbridge from "@/lib/rosbridge";
 import { useROS } from "@/hooks/useROS";
 import { useDiscoveredRobots } from "@/hooks/useDiscoveredRobots";
 
@@ -104,7 +103,7 @@ const MapContent = () => {
   const [isLoaded, setIsLoaded] = useState(false);
   const mapRef = useRef(null);
 
-  const { isConnected } = useROS();
+  const { isConnected, subscribe } = useROS();
   const robotIds = useDiscoveredRobots();
   const [positions, setPositions] = useState<Record<number, RobotPosition>>({});
 
@@ -115,7 +114,7 @@ const MapContent = () => {
 
     for (const id of robotIds) {
       const spawn = SPAWN_POSITIONS[id] ?? { x: 0, y: 0 };
-      const unsub = rosbridge.subscribe<OdometryMessage>(
+      const unsub = subscribe<OdometryMessage>(
         `/tb3_${id}/odom`,
         "nav_msgs/Odometry",
         (msg) => {
@@ -134,7 +133,7 @@ const MapContent = () => {
     }
 
     return () => unsubs.forEach((u) => u());
-  }, [isConnected, robotIds]);
+  }, [isConnected, robotIds, subscribe]);
 
   type LatLngTuple = [number, number];
   const center: LatLngTuple = [ANCHOR_LAT, ANCHOR_LNG];
