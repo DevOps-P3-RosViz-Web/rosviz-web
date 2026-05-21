@@ -3,6 +3,7 @@
 import { Suspense, useEffect, useRef, useState } from 'react';
 import dynamic from 'next/dynamic';
 import Split from 'split.js';
+import { usePathname, useRouter } from 'next/navigation';
 import { Button } from "@/components/ui/button";
 import { 
   Grid,
@@ -71,12 +72,22 @@ export default function DashboardClient() {
   const mainSplitRef = useRef(null);
   const leftSplitRef = useRef(null);
   const [activeTab, setActiveTab] = useState('dashboard');
+  const router = useRouter();
+  const pathname = usePathname();
 
 
   const { isConnected } = useROS();
   const robots = useDiscoveredRobots();
   const { selectedRobotId, selectRobot, isSwitchingRobot } = useRobotSelection();
   const hasRobot = selectedRobotId !== null;
+
+  const handleRobotSelect = (id: number) => {
+    if (pathname.startsWith('/robot/')) {
+      router.push(`/robot/tb3_${id}`);
+      return;
+    }
+    void selectRobot(id);
+  };
 
   // Keep a valid robot selected: pick the first discovered robot on startup,
   // and recover if the currently-selected robot leaves the network.
@@ -187,7 +198,7 @@ export default function DashboardClient() {
           <RobotSelector
             robots={robots}
             selectedRobotId={selectedRobotId}
-            onSelect={selectRobot}
+            onSelect={handleRobotSelect}
             isConnected={isConnected}
           />
           <span className="text-gray-600 mx-2">|</span>
