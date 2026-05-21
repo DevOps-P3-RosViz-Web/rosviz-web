@@ -1,19 +1,31 @@
 #!/usr/bin/env python3
-import math
-from typing import Dict, List, Optional, Tuple
+
+from collections import deque
+from typing import Deque, Dict, List, Optional, Tuple
 
 import rclpy
+import tf2_ros
+from rclpy.clock import Clock, ClockType
 from rclpy.duration import Duration
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
-from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy
+from rclpy.qos import QoSHistoryPolicy, QoSProfile, QoSReliabilityPolicy, \
+    qos_profile_sensor_data, DurabilityPolicy, ReliabilityPolicy
 from rclpy.time import Time
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs_py import point_cloud2
-import tf2_ros
+from tf2_msgs.msg import TFMessage
+from tf2_ros import ConnectivityException, ExtrapolationException, \
+    LookupException, TransformException
+from tf2_sensor_msgs.tf2_sensor_msgs import do_transform_cloud
+
+from debug_utils import DebugLogger
 
 
 class PointCloudAggregator(Node):
+
     def __init__(self) -> None:
+
         super().__init__("pointcloud_aggregator")
 
         self.declare_parameter("num_robots", 3)
@@ -21,255 +33,349 @@ class PointCloudAggregator(Node):
         self.declare_parameter("target_frame", "world")
         self.declare_parameter("output_topic", "/common/scan/points")
         self.declare_parameter("publish_rate_hz", 8.0)
-        self.declare_parameter("stale_timeout_sec", 1.0)
+        self.declare_parameter("stale_timeout_sec", 4.0)
+        self.declare_parameter("transform_timeout_sec", 0.25)
+        self.declare_parameter("queue_size_per_robot", 32)
         self.declare_parameter("debug_logs", True)
-        self.declare_parameter("source_frame_from_topic_namespace", True)
 
         self.num_robots = int(self.get_parameter("num_robots").value)
-        self.input_topic_suffix = str(self.get_parameter("input_topic_suffix").value)
+        self.input_topic_suffix = str(
+            self.get_parameter("input_topic_suffix").value)
         self.target_frame = str(self.get_parameter("target_frame").value)
         self.output_topic = str(self.get_parameter("output_topic").value)
-        self.publish_rate_hz = float(self.get_parameter("publish_rate_hz").value)
-        self.stale_timeout_sec = float(self.get_parameter("stale_timeout_sec").value)
+        self.publish_rate_hz = float(
+            self.get_parameter("publish_rate_hz").value)
+        self.stale_timeout_sec = float(
+            self.get_parameter("stale_timeout_sec").value)
+        self.transform_timeout_sec = float(
+            self.get_parameter("transform_timeout_sec").value)
+        self.queue_size_per_robot = int(
+            self.get_parameter("queue_size_per_robot").value)
         self.debug_logs = bool(self.get_parameter("debug_logs").value)
-        self.source_frame_from_topic_namespace = bool(
-            self.get_parameter("source_frame_from_topic_namespace").value
+
+        self.debug_logger = DebugLogger(enabled=self.debug_logs)
+
+        self.tf_buffer = tf2_ros.Buffer(
+            cache_time=Duration(seconds=60.0),
+            # node=self
         )
+        #
+        # self.tf_listener = tf2_ros.TransformListener(
+        #     self.tf_buffer, self, spin_thread=True
+        # )
 
-        if not self.input_topic_suffix.startswith("/"):
-            self.input_topic_suffix = f"/{self.input_topic_suffix}"
-        if self.publish_rate_hz <= 0:
-            self.publish_rate_hz = 8.0
+        self.pending_clouds_by_robot_id: Dict[int, Deque[PointCloud2]] = {
+            robot_id: deque(maxlen=self.queue_size_per_robot)
+            for robot_id in range(self.num_robots)
+        }
 
-        qos = QoSProfile(
-            reliability=QoSReliabilityPolicy.BEST_EFFORT,
-            history=QoSHistoryPolicy.KEEP_LAST,
-            depth=5,
-        )
-        self.publisher = self.create_publisher(PointCloud2, self.output_topic, qos)
-
-        self.tf_buffer = tf2_ros.Buffer(cache_time=Duration(seconds=10.0))
-        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-
-        self.latest_clouds: Dict[int, PointCloud2] = {}
-        self.subscribers = []
         self.publish_cycles = 0
-        self.last_debug_ns = 0
-        self.last_tf_debug_ns = 0
 
-        topics = []
-        for i in range(self.num_robots):
-            topic = f"/tb3_{i}{self.input_topic_suffix}"
-            topics.append(topic)
-            self.subscribers.append(
-                self.create_subscription(
-                    PointCloud2,
-                    topic,
-                    lambda msg, robot_id=i: self._cloud_cb(robot_id, msg),
-                    qos,
-                )
+        self._subscriptions = [
+            self.create_subscription(
+                PointCloud2,
+                f"/tb3_{robot_id}{self.input_topic_suffix}",
+                lambda msg, rid=robot_id: self._handle_point_cloud_message(rid,
+                                                                           msg),
+                qos_profile_sensor_data,
+            )
+            for robot_id in range(self.num_robots)
+        ]
+
+        self.sub_tf = self.create_subscription(
+            TFMessage,
+            "/tf",
+            self._debug_tf,
+            100
+        )
+
+        tf_static_qos = QoSProfile(
+            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=100,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
+
+        self.sub_static = self.create_subscription(
+            TFMessage,
+            "/tf_static",
+            self._debug_tf_static,
+            tf_static_qos
+        )
+
+        publisher_qos = QoSProfile(reliability=QoSReliabilityPolicy.BEST_EFFORT,
+                                   history=QoSHistoryPolicy.KEEP_LAST, depth=5)
+
+        self.publisher = self.create_publisher(PointCloud2, self.output_topic,
+                                               publisher_qos)
+
+        self.timer_clock = Clock(clock_type=ClockType.STEADY_TIME)
+
+        self.timer = self.create_timer(
+            1.0 / self.publish_rate_hz,
+            self._publish_merged,
+            clock=self.timer_clock
+        )
+
+        self.debug_logger.info(
+            logger=self.get_logger(),
+            message=f"[init] PointCloudAggregator num_robots={self.num_robots} target_frame={self.target_frame} publish_rate_hz={self.publish_rate_hz} transform_timeout_sec={self.transform_timeout_sec} queue_size_per_robot={self.queue_size_per_robot}",
+        )
+
+    def _debug_tf(self, msg):
+
+        for t in msg.transforms:
+            self.tf_buffer.set_transform(
+                t,
+                "default_authority"
             )
 
-        self.get_logger().info(
-            "PointCloud aggregator config: "
-            f"num_robots={self.num_robots}, "
-            f"input_topic_suffix={self.input_topic_suffix}, "
-            f"target_frame={self.target_frame}, "
-            f"output_topic={self.output_topic}, "
-            f"publish_rate_hz={self.publish_rate_hz}"
+            # self.get_logger().info(
+            #     f"##########3 TF: parent='{t.header.frame_id}' "
+            #     f"child='{t.child_frame_id}' "
+            #     f"stamp={t.header.stamp.sec}.{t.header.stamp.nanosec}"
+            # )
+
+    def _debug_tf_static(self, msg):
+
+        # self.get_logger().info(
+        #     f"STATIC TF COUNT={len(msg.transforms)}"
+        # )
+
+        for t in msg.transforms:
+            self.tf_buffer.set_transform_static(
+                t,
+                "default_authority"
+            )
+
+            # self.get_logger().info(
+            #     f"STATIC parent='{t.header.frame_id}' "
+            #     f"child='{t.child_frame_id}'"
+            # )
+
+    def _handle_point_cloud_message(self, robot_id: int,
+                                    msg: PointCloud2) -> None:
+
+        self.pending_clouds_by_robot_id[robot_id].append(msg)
+
+        self.debug_logger.throttled_info(
+            logger=self.get_logger(),
+            key=f"rx_{robot_id}",
+            throttle_sec=2.0,
+            message=f"[rx] robot={robot_id} frame={msg.header.frame_id} stamp={msg.header.stamp.sec}.{msg.header.stamp.nanosec:09d} size={msg.width}x{msg.height} queued={len(self.pending_clouds_by_robot_id[robot_id])}",
         )
-        self.get_logger().info(f"Subscribing to: {', '.join(topics)}")
-
-        period = 1.0 / self.publish_rate_hz
-        self.timer = self.create_timer(period, self._publish_merged)
-
-    def _cloud_cb(self, robot_id: int, msg: PointCloud2) -> None:
-        self.latest_clouds[robot_id] = msg
-        if self.debug_logs:
-            now_ns = self.get_clock().now().nanoseconds
-            if now_ns - self.last_debug_ns > int(2e9):
-                self.last_debug_ns = now_ns
-                self.get_logger().info(
-                    f"[rx] robot={robot_id} topic_frame={msg.header.frame_id} "
-                    f"stamp={msg.header.stamp.sec}.{msg.header.stamp.nanosec:09d} "
-                    f"size={msg.width}x{msg.height}"
-                )
 
     def _is_stale(self, msg: PointCloud2) -> bool:
-        stamp = Time.from_msg(msg.header.stamp)
-        age_ns = (self.get_clock().now() - stamp).nanoseconds
-        # During startup or clock transitions, age can be negative.
-        # Treat those samples as fresh instead of discarding.
+
+        msg_time = Time.from_msg(msg.header.stamp)
+
+        now = self.get_clock().now()
+
+        age_ns = (now - msg_time).nanoseconds
+
         if age_ns < 0:
             return False
+
         return age_ns > int(self.stale_timeout_sec * 1e9)
 
-    def _resolve_source_frame(self, robot_id: int, frame_id: str) -> str:
-        if not self.source_frame_from_topic_namespace:
-            return frame_id
-        if "/" in frame_id:
-            return frame_id
-        return f"tb3_{robot_id}/{frame_id}"
-
-    @staticmethod
-    def _rotate_vec_by_quat(
-        x: float, y: float, z: float, qx: float, qy: float, qz: float, qw: float
-    ) -> Tuple[float, float, float]:
-        # Quaternion-vector multiplication optimized for point rotation.
-        ix = qw * x + qy * z - qz * y
-        iy = qw * y + qz * x - qx * z
-        iz = qw * z + qx * y - qy * x
-        iw = -qx * x - qy * y - qz * z
-
-        rx = ix * qw + iw * -qx + iy * -qz - iz * -qy
-        ry = iy * qw + iw * -qy + iz * -qx - ix * -qz
-        rz = iz * qw + iw * -qz + ix * -qy - iy * -qx
-        return rx, ry, rz
-
-    def _transform_to_target_xyz(
-        self, robot_id: int, msg: PointCloud2
-    ) -> Optional[List[Tuple[float, float, float]]]:
-        raw_src_frame = msg.header.frame_id
-        src_frame = self._resolve_source_frame(robot_id, raw_src_frame)
-        if not src_frame:
-            return None
-
-        msg_for_tf = msg
-        if src_frame != raw_src_frame:
-            msg_for_tf = PointCloud2()
-            msg_for_tf.header = msg.header
-            msg_for_tf.height = msg.height
-            msg_for_tf.width = msg.width
-            msg_for_tf.fields = msg.fields
-            msg_for_tf.is_bigendian = msg.is_bigendian
-            msg_for_tf.point_step = msg.point_step
-            msg_for_tf.row_step = msg.row_step
-            msg_for_tf.data = msg.data
-            msg_for_tf.is_dense = msg.is_dense
-            msg_for_tf.header.frame_id = src_frame
-
-        points = self._cloud_to_xyz(msg_for_tf)
-        if not points:
-            return []
-
-        if src_frame == self.target_frame:
-            return points
+    def _lookup_transform(self, source_frame: str, stamp: Time) -> Optional[
+        tf2_ros.TransformStamped]:
 
         try:
-            tf = self.tf_buffer.lookup_transform(
+            return self.tf_buffer.lookup_transform(
                 self.target_frame,
-                src_frame,
-                Time.from_msg(msg_for_tf.header.stamp),
-                timeout=Duration(seconds=0.05),
+                source_frame,
+                stamp,
+                timeout=Duration(seconds=0.0)
+                # timeout=Duration(seconds=self.transform_timeout_sec)
             )
-            tx = tf.transform.translation.x
-            ty = tf.transform.translation.y
-            tz = tf.transform.translation.z
-            qx = tf.transform.rotation.x
-            qy = tf.transform.rotation.y
-            qz = tf.transform.rotation.z
-            qw = tf.transform.rotation.w
 
-            transformed_points: List[Tuple[float, float, float]] = []
-            for px, py, pz in points:
-                rx, ry, rz = self._rotate_vec_by_quat(px, py, pz, qx, qy, qz, qw)
-                transformed_points.append((rx + tx, ry + ty, rz + tz))
-            return transformed_points
-        except Exception as exc:
-            if self.debug_logs:
-                now_ns = self.get_clock().now().nanoseconds
-                if now_ns - self.last_tf_debug_ns > int(2e9):
-                    self.last_tf_debug_ns = now_ns
-                    frames = self.tf_buffer.all_frames_as_yaml()
-                    frame_preview = frames[:600].replace("\n", " | ")
-                    self.get_logger().warn(
-                        f"[tf] known frames preview: {frame_preview}"
-                    )
-                self.get_logger().warn(
-                    f"[tf] failed transform {src_frame} (raw={raw_src_frame}) -> {self.target_frame}: {exc}"
-                )
+        except (LookupException, ConnectivityException, ExtrapolationException,
+                TransformException):
             return None
 
-    def _cloud_to_xyz(self, cloud: PointCloud2) -> List[Tuple[float, float, float]]:
-        points: List[Tuple[float, float, float]] = []
-        for p in point_cloud2.read_points(
-            cloud,
-            field_names=("x", "y", "z"),
-            skip_nans=True,
-        ):
-            x = float(p[0])
-            y = float(p[1])
-            z = float(p[2])
-            if math.isfinite(x) and math.isfinite(y) and math.isfinite(z):
-                points.append((x, y, z))
-        return points
+    def _transform_cloud_to_target(self, msg: PointCloud2) -> Optional[
+        PointCloud2]:
+
+        source_frame = msg.header.frame_id
+
+        if not source_frame:
+            return None
+
+        if source_frame == self.target_frame:
+            return msg
+
+        cloud_stamp = Time.from_msg(msg.header.stamp)
+
+        transform = self._lookup_transform(source_frame, cloud_stamp)
+
+        if transform is None:
+            return None
+
+        try:
+
+            #
+            # CLEAN XYZ-ONLY CLOUD
+            #
+            # tf2_sensor_msgs has issues with some structured dtypes
+            # produced by Gazebo/LiDAR plugins.
+            #
+
+            xyz_points = list(
+                point_cloud2.read_points(
+                    msg,
+                    field_names=("x", "y", "z"),
+                    skip_nans=True,
+                )
+            )
+
+            clean_cloud = point_cloud2.create_cloud_xyz32(
+                msg.header,
+                xyz_points,
+            )
+
+            transformed_cloud = do_transform_cloud(
+                clean_cloud,
+                transform,
+            )
+
+            transformed_cloud.header.frame_id = self.target_frame
+
+            return transformed_cloud
+
+        except Exception as exc:
+
+            self.debug_logger.throttled_warn(
+                logger=self.get_logger(),
+                key=f"transform_apply_fail_{source_frame}",
+                throttle_sec=2.0,
+                message=f"[tf] failed applying transform {source_frame} -> {self.target_frame}: {exc}",
+            )
+
+            return None
+
+    @staticmethod
+    def _cloud_to_xyz(cloud: PointCloud2) -> List[Tuple[float, float, float]]:
+
+        return [
+            (float(point[0]), float(point[1]), float(point[2]))
+            for point in
+            point_cloud2.read_points(
+                cloud, field_names=("x", "y", "z"), skip_nans=True
+            )
+        ]
 
     def _publish_merged(self) -> None:
-        merged_xyz: List[Tuple[float, float, float]] = []
-        now = self.get_clock().now().to_msg()
-        used_any = False
+
         self.publish_cycles += 1
+
+        try:
+            frames = self.tf_buffer.all_frames_as_string()
+            self.get_logger().info(f"[tf] known frames:\n{frames}")
+        except Exception as exc:
+            self.get_logger().warn(f"[tf] could not list frames: {exc}")
+
+        merged_xyz: List[Tuple[float, float, float]] = []
+
         stale_count = 0
-        tf_fail_count = 0
+        tf_waiting_count = 0
+        processed_count = 0
+
         point_count_by_robot: Dict[int, int] = {}
 
-        for rid, msg in self.latest_clouds.items():
-            if self.debug_logs and self.publish_cycles % 16 == 0:
-                stamp = Time.from_msg(msg.header.stamp)
-                age_ns = (self.get_clock().now() - stamp).nanoseconds
-                self.get_logger().info(
-                    f"[cycle] robot={rid} frame={msg.header.frame_id} age_ns={age_ns}"
-                )
-            if self._is_stale(msg):
-                stale_count += 1
-                continue
+        for robot_id, queue in self.pending_clouds_by_robot_id.items():
 
-            transformed_points = self._transform_to_target_xyz(rid, msg)
-            if transformed_points is None:
-                tf_fail_count += 1
-                continue
+            while queue:
 
-            used_any = True
-            point_count_by_robot[rid] = len(transformed_points)
-            merged_xyz.extend(transformed_points)
+                msg = queue[0]
 
-        if not used_any or not merged_xyz:
-            if self.debug_logs and self.publish_cycles % 16 == 0:
-                source_frames = {
-                    rid: msg.header.frame_id for rid, msg in self.latest_clouds.items()
-                }
-                self.get_logger().warn(
-                    "[publish] skipped "
-                    f"used_any={used_any} merged_points={len(merged_xyz)} "
-                    f"cached_clouds={len(self.latest_clouds)} stale={stale_count} "
-                    f"tf_fail={tf_fail_count} target_frame={self.target_frame} "
-                    f"source_frames={source_frames}"
-                )
+                if self._is_stale(msg):
+                    queue.popleft()
+
+                    stale_count += 1
+
+                    continue
+
+                transformed_cloud = self._transform_cloud_to_target(msg)
+
+                if transformed_cloud is None:
+                    tf_waiting_count += 1
+                    break
+
+                queue.popleft()
+
+                points = self._cloud_to_xyz(transformed_cloud)
+
+                if not points:
+                    continue
+
+                processed_count += 1
+
+                point_count_by_robot[robot_id] = point_count_by_robot.get(
+                    robot_id, 0) + len(points)
+
+                merged_xyz.extend(points)
+
+        if not merged_xyz:
+            self.debug_logger.throttled_warn(
+                logger=self.get_logger(),
+                key="publish_skipped",
+                throttle_sec=2.0,
+                message=f"[publish] skipped tf_waiting={tf_waiting_count} stale={stale_count} processed={processed_count}",
+            )
+
             return
 
         header = PointCloud2().header
         header.frame_id = self.target_frame
-        header.stamp = now
+        header.stamp = self.get_clock().now().to_msg()
+
         merged_cloud = point_cloud2.create_cloud_xyz32(header, merged_xyz)
+
         self.publisher.publish(merged_cloud)
-        if self.debug_logs and self.publish_cycles % 8 == 0:
-            self.get_logger().info(
-                "[publish] merged "
-                f"robots={len(point_count_by_robot)} total_points={len(merged_xyz)} "
-                f"per_robot={point_count_by_robot} target_frame={self.target_frame}"
+
+        if self.debug_logger.every_n(self.publish_cycles, 8):
+            queue_sizes = {robot_id: len(queue) for robot_id, queue in
+                           self.pending_clouds_by_robot_id.items()}
+
+            self.debug_logger.info(
+                logger=self.get_logger(),
+                message=f"[publish] merged robots={len(point_count_by_robot)} total_points={len(merged_xyz)} per_robot={point_count_by_robot} queue_sizes={queue_sizes} stale={stale_count} tf_waiting={tf_waiting_count}",
             )
 
 
-def main(args=None) -> None:
+# def main(args=None) -> None:
+#     rclpy.init(args=args)
+#
+#     node = PointCloudAggregator()
+#
+#     try:
+#         rclpy.spin(node)
+#
+#     finally:
+#         node.destroy_node()
+#
+#         if rclpy.ok():
+#             rclpy.shutdown()
+
+def main(args=None):
     rclpy.init(args=args)
+
     node = PointCloudAggregator()
+
+    executor = MultiThreadedExecutor(num_threads=4)
+
+    executor.add_node(node)
+
     try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
+        executor.spin()
+
     finally:
+        executor.shutdown()
         node.destroy_node()
-        rclpy.shutdown()
+
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == "__main__":

@@ -138,7 +138,8 @@ python3 /ros_ws/scripts/pointcloud_aggregator.py \
     -p input_topic_suffix:=/scan/points \
     -p target_frame:=world \
     -p output_topic:=/common/scan/points \
-    -p publish_rate_hz:=8.0 &
+    -p transform_timeout_sec:=1.0 \
+    -p publish_rate_hz:=1.0 &
 PIDS+=($!)
 sleep 1
 
