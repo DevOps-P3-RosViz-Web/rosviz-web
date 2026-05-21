@@ -47,6 +47,7 @@ sleep 5
 echo "[entrypoint] Starting ros_gz_bridge..."
 BRIDGE_ARGS=()
 BRIDGE_REMAP_ARGS=()
+BRIDGE_ARGS+=("/clock@rosgraph_msgs/msg/Clock[ignition.msgs.Clock")
 for i in $(seq 0 $((NUM_ROBOTS-1))); do
     BRIDGE_ARGS+=(
         "/tb3_$i/cmd_vel@geometry_msgs/msg/Twist]ignition.msgs.Twist"
@@ -68,20 +69,52 @@ ros2 run ros_gz_bridge parameter_bridge "${BRIDGE_ARGS[@]}" --ros-args "${BRIDGE
 PIDS+=($!)
 sleep 2
 
+
+# ── 2.5 Static world -> odom anchors ──
+echo "[entrypoint] Starting world -> odom anchors..."
+
+source /ros_ws/simulation/worlds/robot_spawn_utils.sh
+
+for ((i = 0; i < NUM_ROBOTS; i++)); do
+
+    read -r x y z yaw <<< "$(get_robot_spawn_pose "$i")"
+
+    ros2 run tf2_ros static_transform_publisher \
+        --x "$x" \
+        --y "$y" \
+        --z "$z" \
+        --yaw "$yaw" \
+        --pitch 0.0 \
+        --roll 0.0 \
+        --frame-id world \
+        --child-frame-id "tb3_${i}/odom" &
+
+    PIDS+=($!)
+
+done
+
+sleep 1
+
 # ── 3. robot_state_publisher — one per robot ──
 echo "[entrypoint] Starting robot_state_publisher x $NUM_ROBOTS..."
 URDF_FILE="/opt/ros/humble/share/turtlebot3_description/urdf/turtlebot3_${TURTLEBOT3_MODEL}.urdf"
+
 if [ -f "$URDF_FILE" ]; then
-    ROBOT_DESC=$(cat "$URDF_FILE")
     for i in $(seq 0 $((NUM_ROBOTS-1))); do
+        ROBOT_DESC="$(xacro "$URDF_FILE" namespace:=tb3_${i}/ 2>/dev/null || true)"
+        
+        if [ -z "$ROBOT_DESC" ]; then
+            echo "[entrypoint] WARNING: xacro expansion failed for tb3_$i, falling back to raw URDF."
+            ROBOT_DESC="$(cat "$URDF_FILE")"
+        fi
+
         ros2 run robot_state_publisher robot_state_publisher \
             --ros-args \
             -r __node:=rsp_tb3_$i \
             -r __ns:=/tb3_$i \
             -r /tf:=/tf \
             -r /tf_static:=/tf_static \
-            -p use_sim_time:=false \
-            -p frame_prefix:=tb3_$i/ \
+            -p use_sim_time:=true \
             -p "robot_description:=$ROBOT_DESC" &
         PIDS+=($!)
     done
@@ -96,7 +129,20 @@ python3 /ros_ws/scripts/image_compressor.py &
 PIDS+=($!)
 sleep 1
 
-# ── 4 prime. Muxes for individual view topics ──
+# ── 4.5 Point cloud aggregator (/tb3_i/scan/points -> /common/scan/points) ──
+echo "[entrypoint] Starting point cloud aggregator..."
+python3 /ros_ws/scripts/pointcloud_aggregator.py \
+    --ros-args \
+    -p use_sim_time:=true \
+    -p num_robots:=$NUM_ROBOTS \
+    -p input_topic_suffix:=/scan/points \
+    -p target_frame:=world \
+    -p output_topic:=/common/scan/points \
+    -p publish_rate_hz:=8.0 &
+PIDS+=($!)
+sleep 1
+
+# ── 4.6 Muxes for individual view topics ──
 echo "[entrypoint] Starting muxes..."
 build_robot_topic_list() {
     local topic_suffix="$1"

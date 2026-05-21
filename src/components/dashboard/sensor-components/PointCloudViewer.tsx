@@ -5,10 +5,16 @@ import { useROS } from '@/hooks/useROS';
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls';
 
-interface PointCloudViewerProps {
-  topic: string;
-  robotId: number;
-}
+type PointCloudViewerProps =
+  | {
+      source: "robot";
+      topic: string;
+      robotId: number;
+    }
+  | {
+      source: "global";
+      topic: string;
+    };
 
 interface PointCloud2Message {
   header: {
@@ -31,7 +37,9 @@ interface PointCloud2Message {
   is_dense: boolean;
 }
 
-const PointCloudViewer: React.FC<PointCloudViewerProps> = ({ topic, robotId }) => {
+const PointCloudViewer: React.FC<PointCloudViewerProps> = (props) => {
+  const topic = props.topic;
+  const robotId = props.source === "robot" ? props.robotId : undefined;
   const containerRef = useRef<HTMLDivElement>(null);
   const rendererRef = useRef<THREE.WebGLRenderer | null>(null);
   const sceneRef = useRef<THREE.Scene | null>(null);
@@ -43,9 +51,11 @@ const PointCloudViewer: React.FC<PointCloudViewerProps> = ({ topic, robotId }) =
   const downsampleRef = useRef<number>(2);
   const initializedRef = useRef(false);
 
-  const { subscribe, isConnected } = useROS();
+  const { subscribe } = useROS();
   const [isLoading, setIsLoading] = useState(true);
   const [delayComplete, setDelayComplete] = useState(false);
+  const [hasData, setHasData] = useState(false);
+  const hasDataRef = useRef(false);
 
   // 5-second delay timer
   useEffect(() => {
@@ -170,6 +180,10 @@ const PointCloudViewer: React.FC<PointCloudViewerProps> = ({ topic, robotId }) =
         console.log(`[PointCloud] Frame ${frameCount}: ${message.width}x${message.height} pts, step=${message.point_step}, data type=${typeof message.data}, data length=${message.data?.length || 'N/A'}`);
         console.log(`[PointCloud] Fields:`, message.fields?.map((f: any) => f.name).join(','));
       }
+      if (!hasDataRef.current) {
+        hasDataRef.current = true;
+        setHasData(true);
+      }
       const geometry = pointsRef.current!.geometry;
       const fields = message.fields;
 
@@ -249,7 +263,11 @@ const PointCloudViewer: React.FC<PointCloudViewerProps> = ({ topic, robotId }) =
         </div>
       )}
 
-      {/* ROS connection overlay - removed isConnected gate due to timing */}
+      {delayComplete && !isLoading && !hasData && (
+        <div className="absolute inset-0 flex items-center justify-center bg-black/50 text-gray-400 text-sm">
+          Waiting for point cloud...
+        </div>
+      )}
     </div>
   );
 };

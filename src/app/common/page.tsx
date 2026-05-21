@@ -5,6 +5,7 @@ import { Grid, Eye, AlertTriangle, AlertCircle } from "lucide-react";
 import dynamic from "next/dynamic";
 import { useState, useEffect } from "react";
 import { useDiscoveredRobots } from "@/hooks/useDiscoveredRobots";
+import { useROS } from "@/hooks/useROS";
 
 // const FleetMap = dynamic(() => import('@/components/dashboard/Fleet2DMap'), { ssr: false });
 const MapView = dynamic(() => import("@/components/dashboard/MapView"), { ssr: false });
@@ -24,6 +25,7 @@ const alerts = [
 ];
 
 export default function CommonPage() {
+  const { isConnected } = useROS();
   const robotIds = useDiscoveredRobots();
   const [coords, setCoords] = useState<Record<number, { lat: string; lon: string }>>({});
 
@@ -79,11 +81,17 @@ export default function CommonPage() {
             <MapView />
           </div>
 
-          {/* Point Cloud (for now I only let it display one out of 3 robots points)*/}
+          {/* Point Cloud */}
           <div className="flex-[1.5] min-w-0 bg-[#1e1e1e] rounded-sm border border-[#333333] flex flex-col p-2">
             <span className="text-[#00a5ff] text-sm font-semibold mb-2 shrink-0">Point Cloud</span>
             <div className="flex-1 min-h-0">
-              {robotIds.length > 0 && <PointCloud robotId={robotIds[0]} />}
+              {isConnected ? (
+                <PointCloud source="global" topic="/common/scan/points" />
+              ) : (
+                <div className="h-full flex items-center justify-center text-gray-500 text-xs">
+                  Connecting to ROS...
+                </div>
+              )}
             </div>
           </div>
 

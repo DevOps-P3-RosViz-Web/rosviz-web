@@ -78,6 +78,7 @@ echo "[2/6] Starting ros_gz_bridge..."
 
 BRIDGE_ARGS=()
 BRIDGE_REMAP_ARGS=()
+BRIDGE_ARGS+=("/clock@rosgraph_msgs/msg/Clock[ignition.msgs.Clock")
 for i in $(seq 0 $((NUM_ROBOTS-1))); do
     BRIDGE_ARGS+=(
         "/tb3_$i/cmd_vel@geometry_msgs/msg/Twist]ignition.msgs.Twist"
@@ -106,6 +107,20 @@ COMPRESSOR_PID=$!
 sleep 1
 echo "  Image compressor running (PID: $COMPRESSOR_PID)"
 
+# 3.5 Point cloud aggregator
+echo "[3.5/6] Starting point cloud aggregator..."
+python3 "$PROJECT_DIR/scripts/pointcloud_aggregator.py" \
+    --ros-args \
+    -p use_sim_time:=true \
+    -p num_robots:=$NUM_ROBOTS \
+    -p input_topic_suffix:=/scan/points \
+    -p target_frame:=world \
+    -p output_topic:=/common/scan/points \
+    -p publish_rate_hz:=8.0 &
+AGGREGATOR_PID=$!
+sleep 1
+echo "  Point cloud aggregator running (PID: $AGGREGATOR_PID)"
+
 # 4. Robot state publisher
 echo "[4/6] Starting robot_state_publisher..."
 URDF_FILE=""
@@ -123,13 +138,17 @@ done
 if [ -n "$URDF_FILE" ]; then
     RSP_PIDS=()
     for i in $(seq 0 $((NUM_ROBOTS-1))); do
+        ROBOT_DESC="$(xacro "$URDF_FILE" namespace:=tb3_${i}/ 2>/dev/null || true)"
+        if [ -z "$ROBOT_DESC" ]; then
+            echo "  WARNING: xacro expansion failed for tb3_$i, falling back to raw URDF"
+            ROBOT_DESC="$(cat "$URDF_FILE")"
+        fi
         ros2 run robot_state_publisher robot_state_publisher \
             --ros-args -r __node:=rsp_tb3_$i \
                        -r __ns:=/tb3_$i \
                        -r /tf:=/tf \
                        -r /tf_static:=/tf_static \
-                       -p frame_prefix:=tb3_$i/ \
-            -- "$URDF_FILE" &
+                       -p "robot_description:=$ROBOT_DESC" &
         RSP_PIDS+=($!)
     done
     sleep 1
@@ -154,6 +173,7 @@ echo ""
 echo "  Ignition Gazebo:      PID $IGN_PID"
 echo "  ros_gz_bridge:        PID $BRIDGE_PID"
 echo "  Image compressor:     PID $COMPRESSOR_PID"
+echo "  Point cloud aggregate: PID $AGGREGATOR_PID"
 [ ${#RSP_PIDS[@]:-0} -gt 0 ] && echo "  robot_state_publisher: ${RSP_PIDS[*]}"
 echo "  rosbridge:            PID $ROSBRIDGE_PID"
 echo ""
@@ -173,6 +193,7 @@ cleanup() {
     if [ ${#RSP_PIDS[@]:-0} -gt 0 ]; then
         kill "${RSP_PIDS[@]}" 2>/dev/null || true
     fi
+    kill $AGGREGATOR_PID 2>/dev/null || true
     kill $COMPRESSOR_PID 2>/dev/null || true
     kill $BRIDGE_PID 2>/dev/null || true
     kill $IGN_PID 2>/dev/null || true

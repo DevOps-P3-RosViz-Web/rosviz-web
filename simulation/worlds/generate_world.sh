@@ -7,6 +7,9 @@ set -euo pipefail
 # Resolve absolute path of the directory where this script resides
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Shared robot spawn utilities
+source "$SCRIPT_DIR/robot_spawn_utils.sh"
+
 # Define path to the SDF template file
 TEMPLATE_FILE="$SCRIPT_DIR/turtlebot3_world.template.sdf"
 
@@ -33,30 +36,14 @@ trap cleanup EXIT
 # Loop over robot indices from 0 to NUM_ROBOTS-1
 for ((i = 0; i < NUM_ROBOTS; i++)); do
 
-    # Compute X position: cyclic pattern (-1, 0, 1)
-    x=$(( (i % 3) - 1 ))
-
-    # Compute Y row index (integer division)
-    y=$(( i / 3 ))
-
-    # Invert Y axis to place rows downward
-    y=$(( y * -1 ))
-
-    # Default yaw orientation (radians)
-    yaw="0"
-
-    # Assign orientation based on index modulo 4 (0, 90, 180, -90 degrees)
-    case $((i % 4)) in
-        1) yaw="1.5708" ;;
-        2) yaw="3.1416" ;;
-        3) yaw="-1.5708" ;;
-    esac
+    # Calculate spawn pose for this robot using utility function
+    read -r x y z yaw < <(get_robot_spawn_pose "$i")
 
     # Append generated robot <include> block to temporary file using heredoc
     cat >>"$INCLUDES_FILE" <<EOF
     <include>
       <uri>model://turtlebot3_waffle_$i</uri>
-      <pose>${x} ${y} 0.01 0 0 ${yaw}</pose>
+      <pose>${x} ${y} ${z} 0 0 ${yaw}</pose>
     </include>
 EOF
 
