@@ -188,24 +188,7 @@ pip3 install opencv-python numpy
 npm install
 ```
 
-### Run everything (6 terminals or use the helper script)
-
-A convenience script `simulation/launch_all.sh` starts the full ROS stack. Edit the paths at the top of the script to match your workspace, then:
-
-```bash
-bash simulation/launch_all.sh
-```
-
-Then in a separate terminal start the dashboard:
-
-```bash
-npm run dev
-```
-
-Open <http://localhost:3000>.
-
-<details>
-<summary>If you prefer to run each component manually</summary>
+### Run everything (6 terminals)
 
 **Terminal 1 — Ignition Gazebo (headless)**
 
@@ -259,8 +242,6 @@ ros2 launch rosbridge_server rosbridge_websocket_launch.xml
 ```bash
 npm run dev
 ```
-
-</details>
 
 ## Tauri Development
 
