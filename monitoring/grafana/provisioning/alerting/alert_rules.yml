@@ -1,0 +1,553 @@
+apiVersion: 1
+
+contactPoints:
+  - orgId: 1
+    name: alert-webhook
+    receivers:
+      - uid: alert-webhook-receiver
+        type: webhook
+        settings:
+          # Default: Prometheus health-check (no-op). Override via Grafana UI → Alerting → Contact points.
+          url: http://prometheus:9090/-/healthy
+          httpMethod: POST
+        disableResolveMessage: false
+
+  - orgId: 1
+    name: discord
+    receivers:
+      - uid: discord-receiver
+        type: discord
+        settings:
+          # Paste your Discord webhook URL here or set it via the Grafana UI.
+          url: http://prometheus:9090/-/healthy
+          message: >-
+            **[{{ range .Alerts }}{{ .Labels.severity | upper }}{{ end }}]
+            {{ range .Alerts }}{{ .Labels.alert_type }}{{ end }}**
+            {{ range .Alerts }}{{ .Annotations.summary }}{{ end }}
+            {{ range .Alerts }}{{ .Annotations.description }}{{ end }}
+        disableResolveMessage: false
+
+muteTimings:
+  - orgId: 1
+    name: maintenance-window
+    time_intervals: []
+    # To activate: replace time_intervals with a schedule, e.g.:
+    # time_intervals:
+    #   - times:
+    #       - start_time: '22:00'
+    #         end_time:   '06:00'
+    #     weekdays: ['saturday', 'sunday']
+    # Then: docker compose restart grafana
+    # To deactivate: set time_intervals: [] and restart grafana
+
+policies:
+  - orgId: 1
+    receiver: alert-webhook
+    group_by: ['robot_id', 'alert_type']
+    group_wait: 30s
+    group_interval: 5m
+    repeat_interval: 12h
+    routes:
+      - receiver: discord
+        matchers: []
+        continue: false
+
+groups:
+  - orgId: 1
+    name: robot-thresholds
+    folder: Robot Monitoring
+    interval: 10s
+    rules:
+      - uid: robot-collision-alert
+        title: Robot Collision Risk
+        condition: threshold
+        for: 0s
+        annotations:
+          summary: 'Robot {{ $labels.robot_id }}: collision risk'
+          description: 'Min scan range {{ printf "%.2f" $values.A.Value }} m'
+        labels:
+          severity: critical
+          alert_type: COLLISION
+        data:
+          - refId: A
+            datasourceUid: prometheus-ds
+            relativeTimeRange:
+              from: 30
+              to: 0
+            model:
+              expr: (robot_min_scan_range < on(robot_id) group_left() robot_collision_threshold) and on(robot_id) (robot_connection_status == 1)
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: threshold
+            datasourceUid: '-100'
+            relativeTimeRange:
+              from: 30
+              to: 0
+            model:
+              conditions:
+                - evaluator:
+                    params: [1]
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params: [A]
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: '-100'
+              expression: A
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: threshold
+              type: threshold
+        noDataState: OK
+        execErrState: Alerting
+      - uid: robot-velocity-alert
+        title: Robot Velocity Exceeded
+        condition: threshold
+        for: 10s
+        annotations:
+          summary: 'Robot {{ $labels.robot_id }}: velocity exceeded'
+          description: 'Measured velocity {{ printf "%.2f" $values.A.Value }} m/s or rad/s'
+        labels:
+          severity: warning
+          alert_type: VELOCITY_EXCEEDED
+        data:
+          - refId: A
+            datasourceUid: prometheus-ds
+            relativeTimeRange:
+              from: 30
+              to: 0
+            model:
+              expr: ((robot_velocity_linear > scalar(robot_vel_linear_max)) or (robot_velocity_angular > scalar(robot_vel_angular_max))) and on(robot_id) (robot_connection_status == 1)
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: threshold
+            datasourceUid: '-100'
+            relativeTimeRange:
+              from: 30
+              to: 0
+            model:
+              conditions:
+                - evaluator:
+                    params: [1]
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params: [A]
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: '-100'
+              expression: A
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: threshold
+              type: threshold
+        noDataState: OK
+        execErrState: Alerting
+      - uid: robot-tilt-alert
+        title: Robot Tilt Warning
+        condition: threshold
+        for: 0s
+        annotations:
+          summary: 'Robot {{ $labels.robot_id }}: tilt warning'
+          description: 'Tilt angle {{ printf "%.1f" $values.A.Value }}°'
+        labels:
+          severity: critical
+          alert_type: TILT_WARNING
+        data:
+          - refId: A
+            datasourceUid: prometheus-ds
+            relativeTimeRange:
+              from: 30
+              to: 0
+            model:
+              expr: (robot_tilt_angle_deg > scalar(robot_tilt_max_deg)) and on(robot_id) (robot_connection_status == 1)
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: threshold
+            datasourceUid: '-100'
+            relativeTimeRange:
+              from: 30
+              to: 0
+            model:
+              conditions:
+                - evaluator:
+                    params: [1]
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params: [A]
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: '-100'
+              expression: A
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: threshold
+              type: threshold
+        noDataState: OK
+        execErrState: Alerting
+      - uid: robot-geofence-alert
+        title: Robot Geofence Breach
+        condition: threshold
+        for: 10s
+        annotations:
+          summary: 'Robot {{ $labels.robot_id }}: geofence breach'
+          description: 'Robot outside permitted area'
+        labels:
+          severity: critical
+          alert_type: GEOFENCE_BREACH
+        data:
+          - refId: A
+            datasourceUid: prometheus-ds
+            relativeTimeRange:
+              from: 30
+              to: 0
+            model:
+              expr: (robot_geofence_status > 0) and on(robot_id) (robot_connection_status == 1)
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: threshold
+            datasourceUid: '-100'
+            relativeTimeRange:
+              from: 30
+              to: 0
+            model:
+              conditions:
+                - evaluator:
+                    params: [1]
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params: [A]
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: '-100'
+              expression: A
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: threshold
+              type: threshold
+        noDataState: OK
+        execErrState: Alerting
+      - uid: robot-battery-alert
+        title: Robot Low Battery
+        condition: threshold
+        for: 10s
+        annotations:
+          summary: 'Robot {{ $labels.robot_id }}: low battery'
+          description: 'Battery {{ printf "%.0f" $values.A.Value }}%'
+        labels:
+          severity: warning
+          alert_type: LOW_BATTERY
+        data:
+          - refId: A
+            datasourceUid: prometheus-ds
+            relativeTimeRange:
+              from: 30
+              to: 0
+            model:
+              expr: (robot_battery_percentage < scalar(robot_battery_pct_min)) and on(robot_id) (robot_connection_status == 1)
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: threshold
+            datasourceUid: '-100'
+            relativeTimeRange:
+              from: 30
+              to: 0
+            model:
+              conditions:
+                - evaluator:
+                    params: [1]
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params: [A]
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: '-100'
+              expression: A
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: threshold
+              type: threshold
+        noDataState: OK
+        execErrState: Alerting
+      - uid: robot-connection-alert
+        title: Robot Connection Loss
+        condition: threshold
+        for: 0s
+        annotations:
+          summary: 'Robot {{ $labels.robot_id }}: connection lost'
+          description: 'No sensor data received'
+        labels:
+          severity: critical
+          alert_type: CONNECTION_LOSS
+        data:
+          - refId: A
+            datasourceUid: prometheus-ds
+            relativeTimeRange:
+              from: 30
+              to: 0
+            model:
+              expr: robot_connection_status == 0
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: threshold
+            datasourceUid: '-100'
+            relativeTimeRange:
+              from: 30
+              to: 0
+            model:
+              conditions:
+                - evaluator:
+                    params: [1]
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params: [A]
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: '-100'
+              expression: A
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: threshold
+              type: threshold
+        noDataState: Alerting
+        execErrState: Alerting
+
+      - uid: robot-stall-alert
+        title: Robot Motor Stall
+        condition: threshold
+        for: 10s
+        annotations:
+          summary: 'Robot {{ $labels.robot_id }}: motor stall'
+          description: 'Wheel velocity {{ printf "%.3f" $values.A.Value }} rad/s under active command'
+        labels:
+          severity: warning
+          alert_type: MOTOR_STALL
+        data:
+          - refId: A
+            datasourceUid: prometheus-ds
+            relativeTimeRange:
+              from: 30
+              to: 0
+            model:
+              expr: (robot_motor_stall_status > 0) and on(robot_id) (robot_connection_status == 1)
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: threshold
+            datasourceUid: '-100'
+            relativeTimeRange:
+              from: 30
+              to: 0
+            model:
+              conditions:
+                - evaluator:
+                    params: [1]
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params: [A]
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: '-100'
+              expression: A
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: threshold
+              type: threshold
+        noDataState: OK
+        execErrState: Alerting
+      - uid: robot-monitor-node-alert
+        title: Alert Monitor Node Down
+        condition: threshold
+        for: 30s
+        annotations:
+          summary: 'Alert monitor node is not running'
+          description: 'robot_alert_node_up metric is absent or 0 — the monitoring process has likely crashed'
+        labels:
+          severity: critical
+          alert_type: NODE_DOWN
+        data:
+          - refId: A
+            datasourceUid: prometheus-ds
+            relativeTimeRange:
+              from: 60
+              to: 0
+            model:
+              expr: increase(robot_alert_node_heartbeat[30s])
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: threshold
+            datasourceUid: '-100'
+            relativeTimeRange:
+              from: 60
+              to: 0
+            model:
+              conditions:
+                - evaluator:
+                    params: [1]
+                    type: lt
+                  operator:
+                    type: and
+                  query:
+                    params: [A]
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: '-100'
+              expression: A
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: threshold
+              type: threshold
+        noDataState: Alerting
+        execErrState: Alerting
+
+      - uid: robot-brownout-risk-alert
+        title: Robot Brownout Risk
+        condition: threshold
+        for: 10s
+        annotations:
+          summary: 'Robot {{ $labels.robot_id }}: aggressive maneuver at low battery'
+          description: 'High horizontal acceleration with battery below 30% — brownout risk'
+        labels:
+          severity: warning
+          alert_type: BROWNOUT_RISK
+        data:
+          - refId: A
+            datasourceUid: prometheus-ds
+            relativeTimeRange:
+              from: 30
+              to: 0
+            model:
+              expr: (robot_imu_accel_horiz > 6) and on(robot_id) (robot_battery_percentage < 30) and on(robot_id) (robot_connection_status == 1)
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: threshold
+            datasourceUid: '-100'
+            relativeTimeRange:
+              from: 30
+              to: 0
+            model:
+              conditions:
+                - evaluator:
+                    params: [0]
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params: [A]
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: '-100'
+              expression: A
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: threshold
+              type: threshold
+        noDataState: OK
+        execErrState: OK
+
+      - uid: robot-impact-alert
+        title: Robot Impact Detected
+        condition: threshold
+        for: 0s
+        annotations:
+          summary: 'Robot {{ $labels.robot_id }}: impact detected'
+          description: 'Horizontal acceleration {{ printf "%.1f" $values.A.Value }} m/s²'
+        labels:
+          severity: warning
+          alert_type: IMPACT_DETECTED
+        data:
+          - refId: A
+            datasourceUid: prometheus-ds
+            relativeTimeRange:
+              from: 30
+              to: 0
+            model:
+              expr: (robot_imu_accel_horiz > scalar(robot_impact_accel_max)) and on(robot_id) (robot_connection_status == 1)
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: A
+          - refId: threshold
+            datasourceUid: '-100'
+            relativeTimeRange:
+              from: 30
+              to: 0
+            model:
+              conditions:
+                - evaluator:
+                    params: [1]
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params: [A]
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+              datasource:
+                type: __expr__
+                uid: '-100'
+              expression: A
+              intervalMs: 1000
+              maxDataPoints: 43200
+              refId: threshold
+              type: threshold
+        noDataState: OK
+        execErrState: Alerting

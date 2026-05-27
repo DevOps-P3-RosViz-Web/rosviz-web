@@ -10,6 +10,23 @@ Single-robot dashboard driving a TurtleBot3 Waffle in Ignition Gazebo Fortress:
 
 ![Single-robot demo](docs/rosviz_singleBot.gif)
 
+## Architecture
+
+Sensor data from Gazebo flows through a Python ROS 2 node (`scripts/alert_monitor_node.py`) that evaluates thresholds and publishes alerts on two paths simultaneously: as ROS topic messages consumed by the Next.js dashboard via rosbridge, and as Prometheus metrics scraped by Grafana. The browser's AlertHistory panel receives live alerts over the WebSocket and hydrates from the persistent history file on connect.
+
+```
+Gazebo / TurtleBot3  ──scan/odom/imu/battery──▶  alert_monitor_node.py
+                                                        │
+                           ┌────────────────────────────┼─────────────────────┐
+                           ▼                            ▼                     ▼
+                  /robot_alerts (ROS)          Prometheus :8888      /robot_alerts_history
+                           │                            │                     │
+                    rosbridge :9090             Grafana :3001          rosbridge :9090
+                           │                            │                     │
+                    Next.js dashboard ◀─────────────────┘             Next.js dashboard
+                       (AlertHistory panel)                             (history hydration)
+```
+
 ## Project status
 
 ### Done
@@ -269,7 +286,9 @@ rosviz-web/
 ├── public/
 │   └── meshes/turtlebot3/          # STL meshes for the browser's 3D robot model
 ├── scripts/
-│   └── image_compressor.py         # ROS 2 node: raw Image → JPEG CompressedImage
+│   ├── alert_monitor_node.py       # ROS 2 node: threshold evaluation + alert publishing
+│   ├── image_compressor.py         # ROS 2 node: raw Image → JPEG CompressedImage
+│   └── inject_test_alerts.py       # CLI tool: inject synthetic alerts for pipeline testing
 ├── simulation/
 │   ├── launch_all.sh               # Native one-command launcher
 │   ├── models/
@@ -309,6 +328,52 @@ rosviz-web/
 | `/battery_state` | `sensor_msgs/BatteryState` | Sub | Voltage, percentage |
 | `/robot_description` | `std_msgs/String` | Param | URDF for the 3D model |
 | `/cmd_vel` | `geometry_msgs/Twist` | Pub | Velocity commands to the robot |
+
+## Alert types
+
+The `alert_monitor_node` evaluates eight conditions. Thresholds are all configurable via environment variables (see `.env.example`).
+
+| Alert Type | Severity | Trigger condition | Operator action |
+|---|---|---|---|
+| `COLLISION` | Critical | Laser scan min range < dynamic threshold (footprint + margin + speed × reaction time) | Stop robot; clear obstruction |
+| `VELOCITY_EXCEEDED` | Warning | Linear speed > `ALERT_VEL_LINEAR_MAX` or angular speed > `ALERT_VEL_ANGULAR_MAX` | Reduce commanded velocity |
+| `CONNECTION_LOSS` | Critical | No sensor data received for > `ALERT_CONN_TIMEOUT_S` seconds | Check network; restart rosbridge |
+| `LOW_BATTERY` | Warning | Battery % < `ALERT_BATTERY_PCT_MIN` or voltage < `ALERT_BATTERY_VOLT_MIN` | Return to dock; swap battery |
+| `IMPACT_DETECTED` | Warning | Horizontal IMU acceleration > `ALERT_IMPACT_ACCEL_MS2` m/s² | Inspect for collision damage |
+| `TILT_WARNING` | Critical | Roll or pitch angle > `ALERT_TILT_DEG` degrees | Stop robot; check terrain |
+| `MOTOR_STALL` | Warning | Wheel velocity near zero while active drive command is present for > `ALERT_STALL_DURATION_S` s | Clear obstruction; check motors |
+| `GEOFENCE_BREACH` | Critical | Robot position outside configured bounding box (`ALERT_GEOFENCE_*`) | Stop robot; return to safe zone |
+
+To test the full alert pipeline without a running simulation:
+
+```bash
+docker exec rosviz-ros python3 /ros_ws/scripts/inject_test_alerts.py --all
+# or a specific type:
+docker exec rosviz-ros python3 /ros_ws/scripts/inject_test_alerts.py --type COLLISION --robot-id 1
+```
+
+## Troubleshooting
+
+**Alerts not appearing in the dashboard**
+Check the green/red connection dot in the AlertHistory panel header. If red, verify `ws://localhost:9090` is reachable and the ros-stack container is up: `docker compose ps`. Check logs: `docker compose logs rosviz-ros`.
+
+**Grafana shows no data / "No data" panels**
+Check the Prometheus scrape target at `http://localhost:9091/targets` — the `ros-stack` job should be green. Verify the ros-stack container is healthy: `docker compose ps`. If the target is down, wait for the `start_period` healthcheck (30 s) to pass.
+
+**The same alert fires repeatedly / alert spam**
+The sensor reading may be oscillating near the threshold. Increase `ALERT_REFIRE_COOLDOWN_S` in `.env` (default 10 s). You can also inspect the Grafana `for: 10s` stability window — it only fires after the condition holds for 10 consecutive seconds.
+
+**Alert history is empty after restarting the stack**
+Confirm the `alert-data` Docker volume exists: `docker volume ls | grep alert-data`. Inspect the file inside the container: `docker exec rosviz-ros cat /data/alert_history.json`. If the file is missing, ensure `ALERT_HISTORY_FILE=/data/alert_history.json` is set and the volume is mounted in `docker-compose.yml`.
+
+**Disk usage growing unexpectedly**
+Set `PROMETHEUS_RETENTION` in `.env` (default 30 d) and restart Prometheus. Check the TSDB status page at `http://localhost:9091/tsdb-status` to see which series are consuming the most space.
+
+**Auto-stop not working**
+The auto-stop toggle in the AlertHistory panel publishes to `/safety_auto_stop`. Verify the toggle shows "Auto-stop ON". Auto-stop only fires a zero-velocity command for `critical` alerts — warning-level alerts do not trigger it.
+
+**Suppressing alerts during planned maintenance**
+Edit `monitoring/grafana/provisioning/alerting/alert_rules.yml` and populate `time_intervals` under `maintenance-window` with your maintenance schedule, then `docker compose restart grafana`. Set `time_intervals: []` to deactivate. The mute timing appears under `http://localhost:3001/alerting/notifications` for verification.
 
 ## Customizing topics
 

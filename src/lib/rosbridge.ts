@@ -6,6 +6,10 @@ import type {
   ROSMessageBase,
 } from "@/types/ros";
 
+function isBase64(s: string): boolean {
+  return s.length > 0 && s.length % 4 === 0 && /^[A-Za-z0-9+/]+=*$/.test(s);
+}
+
 class ROSBridge extends EventEmitter {
   private ws: WebSocket | null = null;
   private url: string = "";
@@ -15,6 +19,10 @@ class ROSBridge extends EventEmitter {
     { messageType: string; callbacks: ROSCallback<unknown>[] }
   > = new Map();
   private connectPromise: Promise<void> | null = null;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private reconnectAttempt: number = 0;
+  private readonly RECONNECT_BASE_MS = 1000;
+  private readonly RECONNECT_MAX_MS = 30000;
 
   async connect(url: string = "ws://localhost:9090"): Promise<void> {
     if (this.connected) return;
@@ -29,6 +37,7 @@ class ROSBridge extends EventEmitter {
         this.ws.onopen = () => {
           console.log("Connected to ROSBridge server");
           this.connected = true;
+          this.reconnectAttempt = 0;
           this.emit("connected");
           this.resubscribeAll();
           this.connectPromise = null;
@@ -40,6 +49,7 @@ class ROSBridge extends EventEmitter {
           this.connected = false;
           this.emit("disconnected");
           this.connectPromise = null;
+          this.scheduleReconnect();
         };
 
         this.ws.onerror = (error) => {
@@ -79,11 +89,16 @@ class ROSBridge extends EventEmitter {
         const subscription = this.subscriptions.get(data.topic);
         if (subscription) {
           const msg = data.msg as ROSMessageData;
-          if (msg.data && typeof msg.data === "string") {
-            const binaryData = this.base64ToUint8Array(msg.data);
-            msg.data = binaryData;
+          if (msg.data && typeof msg.data === "string" && isBase64(msg.data)) {
+            msg.data = this.base64ToUint8Array(msg.data);
           }
-          subscription.callbacks.forEach((callback) => callback(msg));
+          subscription.callbacks.forEach((callback) => {
+            try {
+              callback(msg);
+            } catch (err) {
+              console.error(`[rosbridge] Callback error on topic ${data.topic}:`, err);
+            }
+          });
         }
       }
     } catch (error) {
@@ -92,17 +107,12 @@ class ROSBridge extends EventEmitter {
   }
 
   private base64ToUint8Array(base64: string): Uint8Array {
-    try {
-      const binaryString = atob(base64);
-      const bytes = new Uint8Array(binaryString.length);
-      for (let i = 0; i < binaryString.length; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
-      }
-      return bytes;
-    } catch (error) {
-      console.error("Error converting base64 to Uint8Array:", error);
-      throw error;
+    const binaryString = atob(base64);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
     }
+    return bytes;
   }
 
   private resubscribeAll() {
@@ -253,11 +263,35 @@ class ROSBridge extends EventEmitter {
     }
   }
 
+  private scheduleReconnect(): void {
+    if (this.reconnectTimer || !this.url) return;
+    const base = Math.min(
+      this.RECONNECT_BASE_MS * Math.pow(2, this.reconnectAttempt),
+      this.RECONNECT_MAX_MS
+    );
+    const jitter = base * 0.2 * (Math.random() * 2 - 1); // ±20%
+    const delay = Math.round(base + jitter);
+    this.reconnectAttempt++;
+    console.log(`Reconnecting to ROSBridge in ${delay}ms (attempt ${this.reconnectAttempt})...`);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (!this.connected) {
+        this.connect(this.url).catch(() => {
+          // onclose will schedule the next attempt
+        });
+      }
+    }, delay);
+  }
+
   isConnected(): boolean {
     return this.connected && this.ws?.readyState === WebSocket.OPEN;
   }
 
   disconnect(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     if (this.ws) {
       this.ws.close();
     }

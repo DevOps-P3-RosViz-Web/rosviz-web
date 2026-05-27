@@ -53,6 +53,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libdrm-dev \
     && rm -rf /var/lib/apt/lists/*
 
+RUN pip3 install --no-cache-dir prometheus-client
 
 # ── Working directory ──
 WORKDIR /ros_ws
@@ -72,6 +73,8 @@ ENV IGN_GAZEBO_RESOURCE_PATH=/ros_ws/simulation/models
 
 # ── Ports ──
 #  9090  rosbridge WebSocket (browser connects here)
+#  8888  Prometheus metrics (alert_monitor_node)
 EXPOSE 9090
+EXPOSE 8888
 
 ENTRYPOINT ["/ros-entrypoint.sh"]

@@ -67,6 +67,35 @@ export const TOPICS = {
     type: "sensor_msgs/CompressedImage",
     perRobot: false,
   },
+
+  // ── Alert topics (fleet-wide, published by alert_monitor_node.py) ──
+  robotAlerts: {
+    path: "/robot_alerts",
+    type: "std_msgs/String",
+    perRobot: false,
+  },
+  robotAlertsHistory: {
+    path: "/robot_alerts_history",
+    type: "std_msgs/String",
+    perRobot: false,
+  },
+  robotAlertsRequestHistory: {
+    path: "/robot_alerts_request_history",
+    type: "std_msgs/String",
+    perRobot: false,
+  },
+
+  // ── Safety auto-stop (toggle command + status echo) ──
+  safetyAutoStop: {
+    path: "/safety_auto_stop",
+    type: "std_msgs/Bool",
+    perRobot: false,
+  },
+  safetyAutoStopStatus: {
+    path: "/safety_auto_stop_status",
+    type: "std_msgs/Bool",
+    perRobot: false,
+  },
 } as const satisfies Record<string, TopicEntry>;
 
 export type TopicKey = keyof typeof TOPICS;

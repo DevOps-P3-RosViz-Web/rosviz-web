@@ -37,6 +37,7 @@ services:
       - IGN_GAZEBO_RESOURCE_PATH=/ros_ws/simulation/models
       # Rendering: Xvfb software mode (no GPU needed)
       - GPU_MODE=none
+      - ALERT_HISTORY_FILE=/data/alert_history.json
     ports:
       # rosbridge WebSocket — browser connects here
       - "9090:9090"
@@ -44,9 +45,17 @@ services:
       # Mount simulation files for easy editing without rebuild
       - ./simulation:/ros_ws/simulation
       - ./scripts:/ros_ws/scripts
+      - alert-data:/data
     # Increase shared memory for Gazebo / DDS
     shm_size: '512m'
     restart: unless-stopped
+    stop_grace_period: 30s
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8888/metrics"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
 
   # ─────────────────────────────────────────────
   #  Next.js Dashboard
@@ -69,5 +78,77 @@ services:
       # Tell Next.js to accept connections from outside the container
       - HOSTNAME=0.0.0.0
     depends_on:
-      - ros-stack
+      ros-stack:
+        condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3000"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  # ─────────────────────────────────────────────
+  #  Prometheus — scrapes alert_monitor_node on ros-stack:8888
+  # ─────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    container_name: rosviz-prometheus
+    ports:
+      - "9091:9090"
+    volumes:
+      - prometheus-data:/prometheus
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/prometheus/alert_rules.yml:/etc/prometheus/alert_rules.yml:ro
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=${PROMETHEUS_RETENTION:-30d}'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+    depends_on:
+      ros-stack:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9090/-/healthy"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # ─────────────────────────────────────────────
+  #  Grafana — robot monitoring dashboard on port 3001
+  #  Login: admin / admin
+  # ─────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana-oss:10.4.2
+    container_name: rosviz-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=${GRAFANA_ADMIN_USER:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_ADMIN_PASSWORD:-admin}
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_FEATURE_TOGGLES_ENABLE=ngalert
+      - ALERT_WEBHOOK_URL=${ALERT_WEBHOOK_URL:-http://prometheus:9090/-/healthy}
+      - DISCORD_WEBHOOK_URL=${DISCORD_WEBHOOK_URL:-}
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-storage:/var/lib/grafana
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  grafana-storage:
+  alert-data:
+  prometheus-data:
