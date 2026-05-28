@@ -111,7 +111,6 @@
       </link>
     </model>
 
-    <!-- TurtleBot3 -->
-    <!-- ROBOTS_PLACEHOLDER -->
+{{ROBOT_INCLUDES}}
   </world>
 </sdf>

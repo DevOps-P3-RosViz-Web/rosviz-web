@@ -8,7 +8,6 @@ import {
   Home,
   Navigation,
   MapPin,
-  RotateCw,
   Pause,
   Play,
   AlertCircle,
@@ -51,17 +50,6 @@ interface TwistMessage {
   };
 }
 
-// Define the Supply message type
-interface SupplyMessage {
-  header?: {
-    seq: number;
-    stamp: { secs: number; nsecs: number };
-    frame_id: string;
-  };
-  voltage: number[];
-  current?: number[];
-}
-
 export default function Controls({robotId}: ControlsProps) {
   const [waypoints, setWaypoints] = useState<Waypoint[]>([
     { id: '1', lat: "40.7128", lng: "-74.0060", label: "Point A" },
@@ -91,10 +79,6 @@ export default function Controls({robotId}: ControlsProps) {
     backward: false,
     left: false,
     right: false,
-    up: false,
-    down: false,
-    turnLeft: false,
-    turnRight: false
   });
   
   // ROS connection
@@ -161,35 +145,14 @@ export default function Controls({robotId}: ControlsProps) {
     // Linear movement
     if (pressedKeys.current.forward) twist.linear.x = moveSpeed;
     if (pressedKeys.current.backward) twist.linear.x = -moveSpeed;
-    if (pressedKeys.current.up) twist.linear.z = moveSpeed;
-    if (pressedKeys.current.down) twist.linear.z = -moveSpeed;
-
-    // Angular movement (rotation) — left/right on ground robots maps to yaw, not strafe
-    if (pressedKeys.current.left || pressedKeys.current.turnLeft) twist.angular.z = moveSpeed;
-    if (pressedKeys.current.right || pressedKeys.current.turnRight) twist.angular.z = -moveSpeed;
+    if (pressedKeys.current.left) twist.angular.z = moveSpeed;
+    if (pressedKeys.current.right) twist.angular.z = -moveSpeed;
     
     publishCmd(twist);
   };
   
   const handleEmergencyStop = () => {
     stopMovement();
-  };
-  
-  const handleForceLand = () => {
-    // Stop horizontal movement
-    stopMovement();
-    
-    // Command a slow descent
-    const landingTwist: TwistMessage = {
-      linear: { x: 0, y: 0, z: -0.2 }, // Slow descent
-      angular: { x: 0, y: 0, z: 0 }
-    };
-    publishCmd(landingTwist);
-    
-    // Reset after 5 seconds
-    setTimeout(() => {
-      stopMovement();
-    }, 5000);
   };
   
   const toggleMission = () => {
@@ -300,7 +263,7 @@ export default function Controls({robotId}: ControlsProps) {
         </div>
 
         {/* Current Motion Display */}
-        <div className="bg-[#252525] rounded-md p-2 grid grid-cols-3 gap-2">
+        <div className="bg-[#252525] rounded-md p-2 grid grid-cols-2 gap-2">
           <div className="flex flex-col items-center">
             <span className="text-gray-400 text-xs">Forward/Back</span>
             <span className={`text-base font-mono ${getMotionValueColor(currentTwist.linear.x)}`}>
@@ -308,15 +271,9 @@ export default function Controls({robotId}: ControlsProps) {
             </span>
           </div>
           <div className="flex flex-col items-center">
-            <span className="text-gray-400 text-xs">Left/Right</span>
-            <span className={`text-base font-mono ${getMotionValueColor(currentTwist.linear.y)}`}>
-              {currentTwist.linear.y.toFixed(1)}
-            </span>
-          </div>
-          <div className="flex flex-col items-center">
-            <span className="text-gray-400 text-xs">Up/Down</span>
-            <span className={`text-base font-mono ${getMotionValueColor(currentTwist.linear.z)}`}>
-              {currentTwist.linear.z.toFixed(1)}
+            <span className="text-gray-400 text-xs">Angular Vel</span>
+            <span className={`text-base font-mono ${getMotionValueColor(currentTwist.angular.z)}`}>
+              {currentTwist.angular.z.toFixed(1)}
             </span>
           </div>
         </div>
@@ -386,61 +343,6 @@ export default function Controls({robotId}: ControlsProps) {
                 <ChevronDown className="w-4 h-4" />
               </Button>
               <div />
-            </div>
-            
-            {/* Altitude and Rotation Controls */}
-            <div className="grid grid-cols-2 gap-1 w-[120px]">
-              <div className="text-xs text-gray-500 font-medium col-span-2">ALTITUDE</div>
-              <Button 
-                size="icon" 
-                variant="outline" 
-                className="bg-[#1e1e1e] hover:bg-[#2a2a2a] border-[#333333] text-gray-300 h-9"
-                onMouseDown={() => startMovement('up')}
-                onMouseUp={() => endMovement('up')}
-                onMouseLeave={() => endMovement('up')}
-                onTouchStart={() => startMovement('up')}
-                onTouchEnd={() => endMovement('up')}
-              >
-                <ChevronUp className="w-4 h-4" />
-              </Button>
-              <Button 
-                size="icon" 
-                variant="outline" 
-                className="bg-[#1e1e1e] hover:bg-[#2a2a2a] border-[#333333] text-gray-300 h-9"
-                onMouseDown={() => startMovement('down')}
-                onMouseUp={() => endMovement('down')}
-                onMouseLeave={() => endMovement('down')}
-                onTouchStart={() => startMovement('down')}
-                onTouchEnd={() => endMovement('down')}
-              >
-                <ChevronDown className="w-4 h-4" />
-              </Button>
-              
-              <div className="text-xs text-gray-500 font-medium col-span-2 mt-1">ROTATION</div>
-              <Button 
-                size="icon" 
-                variant="outline" 
-                className="bg-[#1e1e1e] hover:bg-[#2a2a2a] border-[#333333] text-gray-300 h-9"
-                onMouseDown={() => startMovement('turnLeft')}
-                onMouseUp={() => endMovement('turnLeft')}
-                onMouseLeave={() => endMovement('turnLeft')}
-                onTouchStart={() => startMovement('turnLeft')}
-                onTouchEnd={() => endMovement('turnLeft')}
-              >
-                <RotateCw className="w-4 h-4 transform -scale-x-100" />
-              </Button>
-              <Button 
-                size="icon" 
-                variant="outline" 
-                className="bg-[#1e1e1e] hover:bg-[#2a2a2a] border-[#333333] text-gray-300 h-9"
-                onMouseDown={() => startMovement('turnRight')}
-                onMouseUp={() => endMovement('turnRight')}
-                onMouseLeave={() => endMovement('turnRight')}
-                onTouchStart={() => startMovement('turnRight')}
-                onTouchEnd={() => endMovement('turnRight')}
-              >
-                <RotateCw className="w-4 h-4" />
-              </Button>
             </div>
           </div>
 
@@ -515,7 +417,7 @@ export default function Controls({robotId}: ControlsProps) {
                   step="0.1"
                   value={moveSpeed}
                   onChange={(e) => setMoveSpeed(parseFloat(e.target.value))}
-                  className="flex-1 h-2 bg-[#1e1e1e] rounded-lg appearance-none cursor-pointer"
+                  className="flex-1 h-2 rounded-lg cursor-pointer accent-[#00a5ff]"
                 />
                 <span className="text-gray-300 w-8 text-right">{moveSpeed.toFixed(1)}</span>
               </div>
@@ -601,22 +503,14 @@ export default function Controls({robotId}: ControlsProps) {
         </div>
         
         {/* Emergency Controls */}
-        <div className="grid grid-cols-2 gap-2">
+        <div className="grid grid-cols-1 gap-2">
           <Button
             variant="destructive"
-            className="bg-red-900/30 hover:bg-red-900/50 h-9"
+            className="w-full bg-red-900/30 hover:bg-red-900/50 h-9"
             onClick={handleEmergencyStop}
           >
             <AlertCircle className="w-4 h-4 mr-2" />
             Emergency Stop
-          </Button>
-          <Button
-            variant="destructive"
-            className="bg-orange-900/30 hover:bg-orange-900/50 h-9"
-            onClick={handleForceLand}
-          >
-            <RotateCw className="w-4 h-4 mr-2" />
-            Force Land
           </Button>
         </div>
       </div>

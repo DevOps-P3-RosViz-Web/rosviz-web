@@ -33,12 +33,13 @@ Single-robot dashboard driving a TurtleBot3 Waffle in Ignition Gazebo Fortress:
 
 The ROS side already publishes per-robot namespaced topics, but the dashboard still subscribes to the old single-robot `/odom`, `/camera/image_raw/compressed`, `/imu`, `/cmd_vel`, `/scan`, `/battery_state`, `/tf` names. Priorities, in order:
 
-- [ ] **Remap per-robot TF onto a shared `/tf` tree.** Launch each `robot_state_publisher` with `--ros-args -r /tf:=/tf -r /tf_static:=/tf_static` (or equivalent in the gz bridge) so the dashboard can read every robot's pose from one `/tf` subscription. Requires `frame_prefix` (already set) so frame IDs stay unique.
-- [ ] **Port the wireframes into the real dashboard.** Turn the four static `/wireframes/*` pages into functional routes: `/` → Fleet Overview, `/common`, `/robot/[id]` for the per-robot Dashboard + Sensor tabs.
-- [ ] **Drop UAV-only controls.** Remove the altitude (↑ / ↓ `linear.z`), force-land descent, and any other drone-only buttons from `Controls.tsx` — the TurtleBot3 plugin ignores them anyway.
+- [x] **Remap per-robot TF onto a shared `/tf` tree.** Launch each `robot_state_publisher` with `--ros-args -r /tf:=/tf -r /tf_static:=/tf_static` (or equivalent in the gz bridge) so the dashboard can read every robot's pose from one `/tf` subscription. Requires `frame_prefix` (already set) so frame IDs stay unique.
+- [x] **Port the wireframes into the real dashboard.** Turn the four static `/wireframes/*` pages into functional routes: `/` → Fleet Overview, `/common`, `/robot/[id]` for the per-robot Dashboard + Sensor tabs.
+- [x] **Drop UAV-only controls.** Remove the altitude (↑ / ↓ `linear.z`), force-land descent, and any other drone-only buttons from `Controls.tsx` — the TurtleBot3 plugin ignores them anyway.
 - [ ] **Parameterise every component by robot id.** Every `subscribe(...)` / `publish(...)` in `src/components/dashboard/**` should accept a `namespace` prop and prefix topic names with `/tb3_<i>/`. Add a robot-picker to the top bar (matches the wireframe's "Robot Red" label).
 - [ ] **Wire up the Fleet Overview.** Subscribe each robot card to its own `/tb3_<i>/camera/image_raw/compressed`, `/odom`, `/battery_state` and render name / status / battery live.
 - [ ] **Cross-robot panels on the Common tab.** Overlay every robot's position on one 2D map (driven by the shared `/tf` once the remap above lands), merge point clouds (colour-coded per robot), and gate the "Move all Robots" button on valid lat/lon inputs.
+  - Point-cloud merge now runs server-side via `scripts/pointcloud_aggregator.py`, publishing `/common/scan/points` from all `/tb3_<i>/scan/points` inputs in a shared frame.
 - [ ] **Fill the TBD sensor widgets.** Decide how to render Trajectory History (path plot from `/odom` buffer?) and Velocity Gauge (gauge of `|linear.x|` + `|angular.z|`?).
 - [ ] **Camera feed with object detection.** Run YOLO (or similar) on `/tb3_<i>/camera/image_raw` inside a small ROS node, publish both the annotated JPEG (`.../image_detect/compressed`) and a structured `/camera/detections` topic (class, confidence, bbox). Dashboard adds a "Detection" tile next to RGB + Depth and optionally overlays bbox rectangles on the live feed.
 - [ ] **Alert history backend.** The wireframe shows alerts but nothing produces them yet — need a source (collision / velocity thresholds / connection loss) and a ring-buffer publisher.
@@ -187,31 +188,15 @@ pip3 install opencv-python numpy
 npm install
 ```
 
-### Run everything (6 terminals or use the helper script)
-
-A convenience script `simulation/launch_all.sh` starts the full ROS stack. Edit the paths at the top of the script to match your workspace, then:
-
-```bash
-bash simulation/launch_all.sh
-```
-
-Then in a separate terminal start the dashboard:
-
-```bash
-npm run dev
-```
-
-Open <http://localhost:3000>.
-
-<details>
-<summary>If you prefer to run each component manually</summary>
+### Run everything (6 terminals)
 
 **Terminal 1 — Ignition Gazebo (headless)**
 
 ```bash
 source /opt/ros/humble/setup.bash
 export IGN_GAZEBO_RESOURCE_PATH=$(pwd)/simulation/models
-ign gazebo -s -r simulation/worlds/turtlebot3_world.sdf
+bash simulation/worlds/generate_world.sh "${NUM_ROBOTS:-3}" /tmp/turtlebot3_world.generated.sdf
+ign gazebo -s -r /tmp/turtlebot3_world.generated.sdf
 ```
 
 **Terminal 2 — ros_gz_bridge**
@@ -258,8 +243,6 @@ ros2 launch rosbridge_server rosbridge_websocket_launch.xml
 npm run dev
 ```
 
-</details>
-
 ## Tauri Development
 
 With Tauri you can develop and build the desktop version of this app.
@@ -292,7 +275,8 @@ rosviz-web/
 │   ├── models/
 │   │   └── turtlebot3_waffle/      # Ignition Gazebo SDF model
 │   └── worlds/
-│       └── turtlebot3_world.sdf    # Room with walls, obstacles, robot
+│       ├── turtlebot3_world.template.sdf  # Static room template with include placeholder
+│       └── generate_world.sh              # Builds a world file for NUM_ROBOTS robots
 ├── src/
 │   ├── app/                        # Next.js App Router pages + layout
 │   ├── components/
@@ -319,6 +303,7 @@ rosviz-web/
 | `/tf` | `tf2_msgs/TFMessage` | Sub | Transform tree for the 3D model |
 | `/scan` | `sensor_msgs/LaserScan` | Sub | LiDAR range data |
 | `/scan/points` | `sensor_msgs/PointCloud2` | Sub | LiDAR point cloud |
+| `/common/scan/points` | `sensor_msgs/PointCloud2` | Sub | Aggregated multi-robot LiDAR cloud (Common tab) |
 | `/imu` | `sensor_msgs/Imu` | Sub | IMU orientation + angular velocity |
 | `/camera/image_raw/compressed` | `sensor_msgs/CompressedImage` | Sub | JPEG camera feed |
 | `/battery_state` | `sensor_msgs/BatteryState` | Sub | Voltage, percentage |
@@ -330,6 +315,20 @@ rosviz-web/
 All topic names are defined in the component files under `src/components/dashboard/`. Each component's `useEffect` / `subscribe` call specifies the topic name and message type — change them to match your robot's namespace.
 
 The default rosbridge WebSocket URL (`ws://localhost:9090`) is set in `src/hooks/useROS.ts`.
+
+For the Common tab cloud merge, verify the aggregator with:
+
+```bash
+ros2 topic info /common/scan/points
+ros2 topic echo /common/scan/points --once
+```
+
+The aggregator node is `scripts/pointcloud_aggregator.py` and uses:
+- `num_robots`
+- `input_topic_suffix` (default `/scan/points`)
+- `target_frame` (default `world`)
+- `output_topic` (default `/common/scan/points`)
+- `publish_rate_hz` (default `8.0`)
 
 ## Building ROS packages from source
 

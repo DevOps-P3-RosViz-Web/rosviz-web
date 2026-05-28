@@ -83,6 +83,11 @@ const VideoStream: React.FC<VideoStreamProps> = ({ topic, robotId }) => {
           {error}
         </div>
       )}
+      {!hasFrame && (
+        <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black">
+          <div className="w-6 h-6 border-2 border-[#00a5ff] border-t-transparent rounded-full animate-spin" />
+        </div>
+      )}
       {!isConnected && !hasFrame && (
         <div className="absolute inset-0 flex items-center justify-center text-gray-400 text-sm">
           No Signal

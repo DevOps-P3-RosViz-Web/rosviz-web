@@ -28,7 +28,7 @@ interface TelemetryData {
 }
 
 const VideoFeed: React.FC<VideoFeedProps> = ({ robotId }) => {
-  const [telemetry, setTelemetry] = useState<TelemetryData>({
+  const telemetryRef = useRef<TelemetryData>({
     altitude: 0,
     heading: 0,
     speed: 0,
@@ -82,6 +82,48 @@ const VideoFeed: React.FC<VideoFeedProps> = ({ robotId }) => {
   }, []);
   
   // Draw both image and HUD to canvas in one operation
+  const drawHUD = useCallback((ctx: CanvasRenderingContext2D, width: number, height: number) => {
+    const telemetry = telemetryRef.current;
+    // We don't clear the canvas here since we've already drawn the image
+
+    // Draw crosshair
+    const crosshairSize = 20; // Reduced size
+    ctx.strokeStyle = 'rgba(0, 255, 0, 0.3)';
+    ctx.lineWidth = 1;
+
+    // Horizontal line
+    ctx.beginPath();
+    ctx.moveTo(width/2 - crosshairSize, height/2);
+    ctx.lineTo(width/2 + crosshairSize, height/2);
+    ctx.stroke();
+
+    // Vertical line
+    ctx.beginPath();
+    ctx.moveTo(width/2, height/2 - crosshairSize);
+    ctx.lineTo(width/2, height/2 + crosshairSize);
+    ctx.stroke();
+
+    // Center circle
+    ctx.beginPath();
+    ctx.arc(width/2, height/2, 3, 0, 2 * Math.PI);
+    ctx.strokeStyle = 'rgba(0, 255, 0, 0.5)';
+    ctx.stroke();
+
+    // Display telemetry data with minimal rendering
+    // Top bar
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+    ctx.fillRect(10, 10, 140, 36);
+    ctx.fillStyle = '#4ade80'; // Green
+    ctx.font = '12px monospace';
+    ctx.fillText(`HDG: ${telemetry.heading.toFixed(0)}° | SPD: ${telemetry.speed.toFixed(1)}m/s`, 15, 30);
+
+    // Position data - bottom left
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+    ctx.fillRect(10, height - 40, 200, 30);
+    ctx.fillStyle = '#22d3ee'; // Cyan
+    ctx.fillText(`POS: ${telemetry.position.x.toFixed(1)}, ${telemetry.position.y.toFixed(1)}, ${telemetry.altitude.toFixed(1)}m`, 15, height - 20);
+  }, []);
+
   const renderFrame = useCallback((imgBlob: Blob | null = null) => {
     if (!canvasRef.current) return;
     
@@ -133,49 +175,7 @@ const VideoFeed: React.FC<VideoFeedProps> = ({ robotId }) => {
         drawHUD(ctx, width, height);
       }
     }
-  }, [telemetry]);
-  
-  // HUD drawing function
-  const drawHUD = (ctx: CanvasRenderingContext2D, width: number, height: number) => {
-    // We don't clear the canvas here since we've already drawn the image
-    
-    // Draw crosshair
-    const crosshairSize = 20; // Reduced size
-    ctx.strokeStyle = 'rgba(0, 255, 0, 0.3)';
-    ctx.lineWidth = 1;
-    
-    // Horizontal line
-    ctx.beginPath();
-    ctx.moveTo(width/2 - crosshairSize, height/2);
-    ctx.lineTo(width/2 + crosshairSize, height/2);
-    ctx.stroke();
-    
-    // Vertical line
-    ctx.beginPath();
-    ctx.moveTo(width/2, height/2 - crosshairSize);
-    ctx.lineTo(width/2, height/2 + crosshairSize);
-    ctx.stroke();
-    
-    // Center circle
-    ctx.beginPath();
-    ctx.arc(width/2, height/2, 3, 0, 2 * Math.PI);
-    ctx.strokeStyle = 'rgba(0, 255, 0, 0.5)';
-    ctx.stroke();
-    
-    // Display telemetry data with minimal rendering
-    // Top bar
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
-    ctx.fillRect(10, 10, 140, 36);
-    ctx.fillStyle = '#4ade80'; // Green
-    ctx.font = '12px monospace';
-    ctx.fillText(`HDG: ${telemetry.heading.toFixed(0)}° | SPD: ${telemetry.speed.toFixed(1)}m/s`, 15, 30);
-    
-    // Position data - bottom left
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
-    ctx.fillRect(10, height - 40, 200, 30);
-    ctx.fillStyle = '#22d3ee'; // Cyan
-    ctx.fillText(`POS: ${telemetry.position.x.toFixed(1)}, ${telemetry.position.y.toFixed(1)}, ${telemetry.altitude.toFixed(1)}m`, 15, height - 20);
-  };
+  }, [drawHUD]);
   
   // Main animation loop - much less frequent updates
   useEffect(() => {
@@ -261,13 +261,13 @@ const VideoFeed: React.FC<VideoFeedProps> = ({ robotId }) => {
         const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
 
         // Update entire telemetry state in one call to prevent multiple renders
-        setTelemetry({
+        telemetryRef.current = {
           heading: heading,
           speed: speed,
           position: pos,
           altitude: pos.z, // Use Z position as altitude for ground robots
           distanceFromHome: distance
-        });
+        };
         
         lastTelemetryUpdate.current = now;
       }, robotId)

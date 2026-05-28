@@ -22,15 +22,14 @@ const SensorData = dynamic(
 export default function SensorDataPage() {
   const { isConnected } = useROS();
   const robots = useDiscoveredRobots();
-  const { selectedRobotId, selectRobot } = useRobotSelection();
+  const { selectedRobotId, selectRobot, isSwitchingRobot } = useRobotSelection();
 
-  // Same auto-select / recovery logic as the main dashboard.
   useEffect(() => {
-    if (robots.length === 0) return;
+    if (robots.length === 0 || isSwitchingRobot) return;
     if (selectedRobotId === null || !robots.includes(selectedRobotId)) {
-      selectRobot(robots[0]);
+      void selectRobot(robots[0]);
     }
-  }, [robots, selectedRobotId, selectRobot]);
+  }, [robots, selectedRobotId, selectRobot, isSwitchingRobot]);
 
   return (
     <div className="h-screen w-screen overflow-hidden bg-[#1a1a1a]">
@@ -57,7 +56,7 @@ export default function SensorDataPage() {
             Loading...
           </div>
         }>
-          <SensorData robotId={selectedRobotId} />
+          <SensorData key={selectedRobotId} robotId={selectedRobotId} />
         </Suspense>
       )}
     </div>

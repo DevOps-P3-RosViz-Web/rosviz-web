@@ -3,13 +3,15 @@
 import { Suspense, useEffect, useRef, useState } from 'react';
 import dynamic from 'next/dynamic';
 import Split from 'split.js';
+import { usePathname, useRouter } from 'next/navigation';
 import { Button } from "@/components/ui/button";
 import { 
   Grid,
   Plus,
   Minus,
   Activity,
-  ExternalLink
+  ExternalLink,
+  ChevronLeft
 } from 'lucide-react';
 import Link from 'next/link';
 
@@ -70,21 +72,31 @@ export default function DashboardClient() {
   const mainSplitRef = useRef(null);
   const leftSplitRef = useRef(null);
   const [activeTab, setActiveTab] = useState('dashboard');
+  const router = useRouter();
+  const pathname = usePathname();
 
 
   const { isConnected } = useROS();
   const robots = useDiscoveredRobots();
-  const { selectedRobotId, selectRobot } = useRobotSelection();
+  const { selectedRobotId, selectRobot, isSwitchingRobot } = useRobotSelection();
   const hasRobot = selectedRobotId !== null;
+
+  const handleRobotSelect = (id: number) => {
+    if (pathname.startsWith('/robot/')) {
+      router.push(`/robot/tb3_${id}`);
+      return;
+    }
+    void selectRobot(id);
+  };
 
   // Keep a valid robot selected: pick the first discovered robot on startup,
   // and recover if the currently-selected robot leaves the network.
   useEffect(() => {
-    if (robots.length === 0) return;
+    if (robots.length === 0 || isSwitchingRobot) return;
     if (selectedRobotId === null || !robots.includes(selectedRobotId)) {
-      selectRobot(robots[0]);
+      void selectRobot(robots[0]);
     }
-  }, [robots, selectedRobotId, selectRobot]);
+  }, [robots, selectedRobotId, selectRobot, isSwitchingRobot]);
 
   useEffect(() => {
     let mainSplit: Split.Instance;
@@ -133,6 +145,13 @@ export default function DashboardClient() {
       {/* Top Toolbar */}
       <div className="w-full h-12 bg-[#232323] flex items-center px-2 gap-1 border-b border-[#333333]">
         <div className="flex items-center gap-1">
+          <Link href="/">
+            <Button variant="ghost" size="sm" className="h-8 px-3 text-gray-400 hover:text-white hover:bg-[#2a2a2a]">
+              <ChevronLeft className="w-4 h-4 mr-2" />
+              Fleet Overview
+            </Button>
+          </Link>
+          <span className="text-gray-600 mx-2">|</span>
           <Button 
             variant="ghost" 
             size="sm"
@@ -179,7 +198,7 @@ export default function DashboardClient() {
           <RobotSelector
             robots={robots}
             selectedRobotId={selectedRobotId}
-            onSelect={selectRobot}
+            onSelect={handleRobotSelect}
             isConnected={isConnected}
           />
           <span className="text-gray-600 mx-2">|</span>
@@ -201,7 +220,7 @@ export default function DashboardClient() {
                   <span className="text-gray-400">Loading...</span>
                 </div>
               }>
-                <VideoGrid robotId={selectedRobotId} />
+                <VideoGrid key={selectedRobotId} robotId={selectedRobotId} />
               </Suspense>
             </div>
             
@@ -211,7 +230,7 @@ export default function DashboardClient() {
                   <span className="text-gray-400">Loading...</span>
                 </div>
               }>
-                <TelemetryPanel robotId={selectedRobotId} />
+                <TelemetryPanel key={selectedRobotId} robotId={selectedRobotId} />
               </Suspense>
             </div>
           </div>
@@ -223,7 +242,7 @@ export default function DashboardClient() {
                 <span className="text-gray-400">Loading Controls...</span>
               </div>
             }>
-              <Controls robotId={selectedRobotId} />
+              <Controls key={selectedRobotId} robotId={selectedRobotId} />
             </Suspense>
           </div>
         </div>
@@ -233,7 +252,7 @@ export default function DashboardClient() {
             <span className="text-gray-400">Loading Sensor Data...</span>
           </div>
         }>
-          <SensorData  robotId={selectedRobotId}/>
+          <SensorData key={selectedRobotId} robotId={selectedRobotId}/>
         </Suspense>
       )}
     </div>

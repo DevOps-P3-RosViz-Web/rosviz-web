@@ -6,7 +6,7 @@
 #  Each process runs in the background; the script waits for all.
 #  If any process exits, the container stops.
 # =============================================================
-set -e
+set -e # Not -u to allow unset env vars like TURTLEBOT3_MODEL and not -o to allow pipefail since some commands may not output anything
 source /opt/ros/humble/setup.bash
 
 # ── Multi-robot config ──
@@ -21,6 +21,7 @@ echo "  └───────────────────────
 echo ""
 
 PIDS=()
+WORLD_FILE=/tmp/turtlebot3_world.generated.sdf
 cleanup() {
     echo "[entrypoint] Shutting down all processes..."
     for pid in "${PIDS[@]}"; do
@@ -31,67 +32,89 @@ cleanup() {
 }
 trap cleanup SIGINT SIGTERM EXIT
 
-# ── 0. Generate per-robot model folders ──
+# ── 0. Generate per-robot model folders + dynamic world ──
 echo "[entrypoint] Generating $NUM_ROBOTS robot model folders..."
 bash /ros_ws/simulation/models/generate_robots.sh "$NUM_ROBOTS"
-
-ROBOTS_XML=""
-for i in $(seq 0 $((NUM_ROBOTS-1))); do
-    # Spread robots along x axis, alternating sign
-    X=$(awk "BEGIN { print ($i - ($NUM_ROBOTS - 1) / 2.0) }")
-    ROBOTS_XML="${ROBOTS_XML}
-    <include>
-      <uri>model://turtlebot3_waffle_$i</uri>
-      <pose>$X 0 0.01 0 0 0</pose>
-    </include>"
-done
-
-# Replace the placeholder in the base template
-awk -v r="$ROBOTS_XML" '{gsub(/<!-- ROBOTS_PLACEHOLDER -->/, r); print}' \
-    /ros_ws/simulation/worlds/turtlebot3_world_base.sdf \
-    > /tmp/turtlebot3_world.sdf
+bash /ros_ws/simulation/worlds/generate_world.sh "$NUM_ROBOTS" "$WORLD_FILE"
 
 # ── 1. Ignition Gazebo ──
 echo "[entrypoint] Starting Ignition Gazebo (headless)..."
-ign gazebo -s -r /tmp/turtlebot3_world.sdf &
+ign gazebo -s -r "$WORLD_FILE" &
 PIDS+=($!)
 sleep 5
 
-# ── 2. ros_gz_bridge — namespaced per robot ──
+# ── 2. ros_gz_bridge — namespaced per robot, /tf remapped shared ──
 echo "[entrypoint] Starting ros_gz_bridge..."
-BRIDGE_ARGS=""
+BRIDGE_ARGS=()
+BRIDGE_REMAP_ARGS=()
+BRIDGE_ARGS+=("/clock@rosgraph_msgs/msg/Clock[ignition.msgs.Clock")
 for i in $(seq 0 $((NUM_ROBOTS-1))); do
-    BRIDGE_ARGS="$BRIDGE_ARGS \
-        /tb3_$i/cmd_vel@geometry_msgs/msg/Twist]ignition.msgs.Twist \
-        /tb3_$i/odom@nav_msgs/msg/Odometry[ignition.msgs.Odometry \
-        /tb3_$i/scan@sensor_msgs/msg/LaserScan[ignition.msgs.LaserScan \
-        /tb3_$i/imu@sensor_msgs/msg/Imu[ignition.msgs.IMU \
-        /tb3_$i/camera/image_raw@sensor_msgs/msg/Image[ignition.msgs.Image \
-        /tb3_$i/camera/camera_info@sensor_msgs/msg/CameraInfo[ignition.msgs.CameraInfo \
-        /tb3_$i/camera/depth/image_rect_raw@sensor_msgs/msg/Image[ignition.msgs.Image \
-        /tb3_$i/camera/depth/camera_info@sensor_msgs/msg/CameraInfo[ignition.msgs.CameraInfo \
-        /tb3_$i/camera/depth/image_rect_raw/points@sensor_msgs/msg/PointCloud2[ignition.msgs.PointCloudPacked \
-        /tb3_$i/joint_states@sensor_msgs/msg/JointState[ignition.msgs.Model \
-        /tb3_$i/scan/points@sensor_msgs/msg/PointCloud2[ignition.msgs.PointCloudPacked"
+    BRIDGE_ARGS+=(
+        "/tb3_$i/cmd_vel@geometry_msgs/msg/Twist]ignition.msgs.Twist"
+        "/tb3_$i/odom@nav_msgs/msg/Odometry[ignition.msgs.Odometry"
+        "/tb3_$i/tf@tf2_msgs/msg/TFMessage[ignition.msgs.Pose_V"
+        "/tb3_$i/scan@sensor_msgs/msg/LaserScan[ignition.msgs.LaserScan"
+        "/tb3_$i/imu@sensor_msgs/msg/Imu[ignition.msgs.IMU"
+        "/tb3_$i/camera/image_raw@sensor_msgs/msg/Image[ignition.msgs.Image"
+        "/tb3_$i/camera/camera_info@sensor_msgs/msg/CameraInfo[ignition.msgs.CameraInfo"
+        "/tb3_$i/camera/depth/image_rect_raw@sensor_msgs/msg/Image[ignition.msgs.Image"
+        "/tb3_$i/camera/depth/camera_info@sensor_msgs/msg/CameraInfo[ignition.msgs.CameraInfo"
+        "/tb3_$i/camera/depth/image_rect_raw/points@sensor_msgs/msg/PointCloud2[ignition.msgs.PointCloudPacked"
+        "/tb3_$i/joint_states@sensor_msgs/msg/JointState[ignition.msgs.Model"
+        "/tb3_$i/scan/points@sensor_msgs/msg/PointCloud2[ignition.msgs.PointCloudPacked"
+    )
+    BRIDGE_REMAP_ARGS+=(-r "/tb3_$i/tf:=/tf")
 done
-ros2 run ros_gz_bridge parameter_bridge $BRIDGE_ARGS &
+ros2 run ros_gz_bridge parameter_bridge "${BRIDGE_ARGS[@]}" --ros-args "${BRIDGE_REMAP_ARGS[@]}" &
 PIDS+=($!)
 sleep 2
+
+
+# ── 2.5 Static world -> odom anchors ──
+echo "[entrypoint] Starting world -> odom anchors..."
+
+source /ros_ws/simulation/worlds/robot_spawn_utils.sh
+
+for ((i = 0; i < NUM_ROBOTS; i++)); do
+
+    read -r x y z yaw <<< "$(get_robot_spawn_pose "$i")"
+
+    ros2 run tf2_ros static_transform_publisher \
+        --x "$x" \
+        --y "$y" \
+        --z "$z" \
+        --yaw "$yaw" \
+        --pitch 0.0 \
+        --roll 0.0 \
+        --frame-id world \
+        --child-frame-id "tb3_${i}/odom" &
+
+    PIDS+=($!)
+
+done
+
+sleep 1
 
 # ── 3. robot_state_publisher — one per robot ──
 echo "[entrypoint] Starting robot_state_publisher x $NUM_ROBOTS..."
 URDF_FILE="/opt/ros/humble/share/turtlebot3_description/urdf/turtlebot3_${TURTLEBOT3_MODEL}.urdf"
+
 if [ -f "$URDF_FILE" ]; then
-    ROBOT_DESC=$(cat "$URDF_FILE")
     for i in $(seq 0 $((NUM_ROBOTS-1))); do
+        ROBOT_DESC="$(xacro "$URDF_FILE" namespace:=tb3_${i}/ 2>/dev/null || true)"
+        
+        if [ -z "$ROBOT_DESC" ]; then
+            echo "[entrypoint] WARNING: xacro expansion failed for tb3_$i, falling back to raw URDF."
+            ROBOT_DESC="$(cat "$URDF_FILE")"
+        fi
+
         ros2 run robot_state_publisher robot_state_publisher \
             --ros-args \
             -r __node:=rsp_tb3_$i \
             -r __ns:=/tb3_$i \
-            -r /tb3_$i/tf:=/tf \
-            -r /tb3_$i/tf_static:=/tf_static \
-            -p use_sim_time:=false \
-            -p frame_prefix:=tb3_$i/ \
+            -r /tf:=/tf \
+            -r /tf_static:=/tf_static \
+            -p use_sim_time:=true \
             -p "robot_description:=$ROBOT_DESC" &
         PIDS+=($!)
     done
@@ -106,29 +129,46 @@ python3 /ros_ws/scripts/image_compressor.py &
 PIDS+=($!)
 sleep 1
 
-# ── 4 prime. Muxes for individual view topics ──
+# ── 4.5 Point cloud aggregator (/tb3_i/scan/points -> /common/scan/points) ──
+echo "[entrypoint] Starting point cloud aggregator..."
+python3 /ros_ws/scripts/pointcloud_aggregator.py \
+    --ros-args \
+    -p use_sim_time:=true \
+    -p num_robots:=$NUM_ROBOTS \
+    -p input_topic_suffix:=/scan/points \
+    -p target_frame:=world \
+    -p output_topic:=/common/scan/points \
+    -p transform_timeout_sec:=1.0 \
+    -p publish_rate_hz:=1.0 &
+PIDS+=($!)
+sleep 1
+
+# ── 4.6 Muxes for individual view topics ──
 echo "[entrypoint] Starting muxes..."
-build_inputs() {
-    local suffix="$1"
-    local out=""
-    for i in $(seq 0 $((NUM_ROBOTS-1))); do
-        out="$out /tb3_$i/$suffix"
+build_robot_topic_list() {
+    local topic_suffix="$1"
+    local topics=()
+    local robot_id
+
+    for ((robot_id=0; robot_id<NUM_ROBOTS; robot_id++)); do
+        topics+=("/tb3_${robot_id}/${topic_suffix}")
     done
-    echo "$out"
+
+    echo "${topics[@]}"
 }
 
 ros2 run topic_tools mux /selected/scan_points \
-    $(build_inputs scan/points) \
+    $(build_robot_topic_list scan/points) \
     --ros-args -r __node:=mux_scan_points &
 PIDS+=($!)
 
 ros2 run topic_tools mux /selected/camera_image \
-    $(build_inputs camera/image_raw/compressed) \
+    $(build_robot_topic_list camera/image_raw/compressed) \
     --ros-args -r __node:=mux_camera_image &
 PIDS+=($!)
 
 ros2 run topic_tools mux /selected/camera_depth \
-    $(build_inputs camera/depth/image_rect_raw/compressed) \
+    $(build_robot_topic_list camera/depth/image_rect_raw/compressed) \
     --ros-args -r __node:=mux_camera_depth &
 PIDS+=($!)
 sleep 1
