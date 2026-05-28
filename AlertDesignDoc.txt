@@ -1,0 +1,1708 @@
+================================================================================
+  ROSViz Web — Alert System Technical Design Document
+================================================================================
+
+  Covers: alert_monitor_node.py · Prometheus metrics · Grafana dashboard ·
+          React AlertHistory component · Docker Compose integration
+  Stack:  ROS 2 Humble · Gazebo Fortress · Prometheus 2.52 · Grafana 10.4.2 ·
+          Next.js 15 · rosbridge_suite · Python 3.10 · prometheus_client
+
+================================================================================
+  TABLE OF CONTENTS
+================================================================================
+
+  1.  System Architecture Overview
+  2.  Alert Monitor Node  (scripts/alert_monitor_node.py)
+      2.1  Lifecycle and Startup
+      2.2  Prometheus Metrics Catalog
+      2.3  Alert Types, Severities, and Detection Logic
+      2.4  Alert Lifecycle: Fire, Dedup, Clear, Re-fire
+      2.5  Auto-Stop Safety Feature
+      2.6  Alert History Persistence
+      2.7  Node Heartbeat
+      2.8  Simulated Battery Model
+  3.  Prometheus Integration
+      3.1  Scrape Configuration
+      3.2  Threshold Gauges — Single Source of Truth
+  4.  Grafana Dashboard  (monitoring/grafana/dashboards/robot_alerts.json)
+      4.0  Provisioning File Structure
+      4.1  Template Variable
+      4.2  Panel Inventory
+      4.3  Unified Alerting Rules
+      4.4  Contact Points and Routing
+      4.5  Maintenance Window
+  5.  React AlertHistory Component  (src/components/dashboard/AlertHistory.tsx)
+      5.1  Real-Time Alert Reception
+      5.2  Reconnect Recovery
+      5.3  Browser Persistence
+      5.4  Filtering, Sorting, and Acknowledgement
+      5.5  Auto-Stop Toggle
+      5.6  Critical Flash
+  6.  Configuration Reference  (.env.example)
+  7.  Docker Compose Service Map
+  8.  End-to-End Alert Flow
+  9.  Robustness Properties and Design Decisions
+  10. User Guide — How to Use the Alert System
+  11. Complete ROS Topic Reference
+  12. AlertMessage JSON Schema and Alert ID Format
+  13. Developer Guide — Adding a New Alert Type
+  14. Security Considerations
+  15. Verification and Smoke-Test Guide
+
+================================================================================
+  1.  SYSTEM ARCHITECTURE OVERVIEW
+================================================================================
+
+  The alert system is a three-layer pipeline:
+
+    [ROS 2 Simulation]
+         |
+         | sensor topics (LaserScan, Odometry, IMU, BatteryState, JointState)
+         v
+    [alert_monitor_node.py]  ── Prometheus metrics ──> [Prometheus :9091]
+         |                                                      |
+         | /robot_alerts (std_msgs/String, JSON)                | scrape :8888
+         | /robot_alerts_history (std_msgs/String, JSON)        v
+         v                                              [Grafana :3001]
+    [rosbridge :9090]                                       alert rules
+         |                                                  dashboards
+         | WebSocket                                        webhooks/Discord
+         v
+    [Next.js Dashboard :3000]
+    [AlertHistory React component]
+
+  The node is the single authoritative source of alert truth. It evaluates all
+  thresholds, fires alerts onto ROS topics for the browser and onto Prometheus
+  metrics for Grafana. The two delivery channels are intentionally independent:
+  the browser panel gives operators real-time situational awareness; Grafana
+  gives persistent time-series history, threshold visualisation, and external
+  notifications (webhook, Discord).
+
+================================================================================
+  2.  ALERT MONITOR NODE  (scripts/alert_monitor_node.py)
+================================================================================
+
+  2.1  LIFECYCLE AND STARTUP
+  ─────────────────────────
+
+  Entry point: main()
+
+    rclpy.init()
+    start_http_server(8888)          # Prometheus scrape endpoint
+    node = AlertMonitorNode(n)       # n = NUM_ROBOTS env var (default 3)
+    _node_up_gauge.set(1)
+    _thresh_*_gauge.set(...)         # publish threshold values to Prometheus
+    threading.Thread(_heartbeat_loop, daemon=True).start()
+
+  On SIGTERM / SIGINT:
+    _node_up_gauge.set(0)
+    _save_alert_history()            # flush ring buffer to disk
+    rclpy.shutdown()
+
+  On SIGKILL (OOM killer, docker kill):
+    Daemon heartbeat thread dies with the process. Prometheus counter stops
+    incrementing. Grafana detects within 30s via increase(heartbeat[30s]) == 0.
+
+  Business benefit: Operators always know whether the monitoring process itself
+  is alive. Previously a crashed monitor would appear to show healthy robots.
+
+
+  2.2  PROMETHEUS METRICS CATALOG
+  ─────────────────────────────────
+
+  All metrics are module-level (shared across restarts within a process).
+  Labels: [robot_id] where shown.
+
+  Counters:
+    robot_alert_total [robot_id, alert_type, severity]
+      — incremented on every alert fire. Pre-seeded to 0 for all 12 alert
+        types × N robots at startup so Grafana always has data for every type.
+    robot_alert_node_heartbeat
+      — incremented every 5 seconds by a daemon thread. Used by Grafana's
+        node-down detection rule.
+
+  Per-robot state Gauges [robot_id]:
+    robot_min_scan_range        — minimum LaserScan range in forward arc (m)
+    robot_velocity_linear       — Odometry linear X velocity (m/s)
+    robot_velocity_angular      — Odometry angular Z velocity (rad/s)
+    robot_battery_percentage    — BatteryState percentage (0–100)
+    robot_imu_accel_horiz       — sqrt(ax² + ay²) horizontal acceleration (m/s²)
+    robot_imu_accel_vert        — IMU Z-axis acceleration (m/s²)
+    robot_tilt_angle_deg        — max(|roll|, |pitch|) in degrees
+    robot_geofence_status       — 0=inside, 1=breach, 2=predictive warning
+    robot_geofence_distance_m   — distance from origin (m)
+    robot_connection_status     — 1=connected, 0=timed out
+    robot_motor_stall_status    — 1=stalling, 0=ok
+    robot_collision_threshold   — dynamic per-robot collision threshold (m)
+    robot_battery_health        — BatteryState power_supply_health code
+    robot_motor_effort          — max wheel joint effort (N·m)
+    robot_safety_auto_stop_enabled — fleet-wide auto-stop flag (0/1)
+
+  Scalar Gauges (no labels):
+    robot_alert_node_up         — 1 while process runs, 0 on clean shutdown
+    robot_vel_linear_max        — ALERT_VEL_LINEAR_MAX threshold (m/s)
+    robot_vel_angular_max       — ALERT_VEL_ANGULAR_MAX threshold (rad/s)
+    robot_battery_pct_min       — ALERT_BATTERY_PCT_MIN threshold (%)
+    robot_impact_accel_max      — ALERT_IMPACT_ACCEL_MS2 threshold (m/s²)
+    robot_tilt_max_deg          — ALERT_TILT_DEG threshold (degrees)
+
+  Business benefit: Grafana alert rules reference the threshold gauges directly
+  via scalar() so a .env change is instantly reflected in both the Python node's
+  behaviour and the Grafana evaluation — no manual YAML synchronisation needed.
+
+
+  2.3  ALERT TYPES, SEVERITIES, AND DETECTION LOGIC
+  ──────────────────────────────────────────────────
+
+  All detection runs inside per-robot ROS subscription callbacks. Connection
+  status is checked via a 1-second timer (_check_connection_timeouts).
+
+  ┌─────────────────────┬──────────┬────────────────────────────────────────────────────────────┐
+  │ Alert Type          │ Severity │ Detection Logic                                             │
+  ├─────────────────────┼──────────┼────────────────────────────────────────────────────────────┤
+  │ COLLISION           │ critical │ Full 360° scan divided into three zones. Severity depends   │
+  │                     │ or       │ on zone and robot motion direction:                         │
+  │                     │ warning  │ Forward ±45°: critical if range < crit_thresh;              │
+  │                     │          │               warning  if range < warn_thresh (2× crit).   │
+  │                     │          │ Rear ±45°:    critical only if robot is reversing;          │
+  │                     │          │               warning  otherwise.                           │
+  │                     │          │ Sides:        critical only if robot is actively turning    │
+  │                     │          │               (sweeping into the obstacle); warning else.   │
+  │                     │          │ crit_thresh = footprint_radius + margin +                   │
+  │                     │          │               speed × scan_reaction_time_s (velocity        │
+  │                     │          │               lookahead tightens threshold at speed).       │
+  │                     │          │ robot_min_scan_range gauge = min(forward, rear, side) —     │
+  │                     │          │ covers full 360°, so Panel 1 can be driven by a rear        │
+  │                     │          │ obstacle even when the robot is stationary.                 │
+  ├─────────────────────┼──────────┼────────────────────────────────────────────────────────────┤
+  │ VELOCITY_EXCEEDED   │ warning  │ |linear_x| > vel_linear_max OR |angular_z| > vel_angular_max│
+  │                     │          │ from Odometry. Both thresholds are independently checked.   │
+  ├─────────────────────┼──────────┼────────────────────────────────────────────────────────────┤
+  │ CONNECTION_LOSS     │ critical │ time.time() - last_msg_time[robot] > conn_timeout_s.        │
+  │                     │          │ Evaluated every second by _check_connection_timeouts.       │
+  │                     │          │ Sets robot_connection_status to 0, which gates all other    │
+  │                     │          │ Grafana alert rules (prevents false positives from stale    │
+  │                     │          │ metrics after a robot goes offline).                        │
+  ├─────────────────────┼──────────┼────────────────────────────────────────────────────────────┤
+  │ LOW_BATTERY         │ warning  │ BatteryState: percentage < bat_pct_min OR voltage < bat_    │
+  │                     │          │ volt_min. Real battery only (simulated battery uses a       │
+  │                     │          │ deterministic drain model; real_battery set tracks which    │
+  │                     │          │ robots have published genuine BatteryState messages).       │
+  ├─────────────────────┼──────────┼────────────────────────────────────────────────────────────┤
+  │ IMPACT_DETECTED     │ warning  │ sqrt(ax² + ay²) > impact_accel_ms2 from IMU linear_         │
+  │                     │          │ acceleration. Detects sudden horizontal deceleration from   │
+  │                     │          │ physical contact or dropped payload.                        │
+  ├─────────────────────┼──────────┼────────────────────────────────────────────────────────────┤
+  │ TILT_WARNING        │ critical │ max(|roll|, |pitch|) > tilt_deg_max, derived from IMU       │
+  │                     │          │ quaternion → euler conversion. Indicates robot is on an     │
+  │                     │          │ unsafe incline or has tipped.                               │
+  ├─────────────────────┼──────────┼────────────────────────────────────────────────────────────┤
+  │ MOTOR_STALL         │ warning  │ Active cmd_vel (|lin|>0.05 or |ang|>0.05) but all wheel     │
+  │                     │          │ JointState velocities < 0.5 rad/s for stall_duration_s.     │
+  │                     │          │ Duration gating prevents false fires from brief stops.      │
+  ├─────────────────────┼──────────┼────────────────────────────────────────────────────────────┤
+  │ GEOFENCE_BREACH     │ critical │ Robot position from Odometry outside [x_min,x_max] ×        │
+  │                     │          │ [y_min,y_max] bounding box. Predictive mode: if current     │
+  │                     │          │ velocity would carry the robot outside in                   │
+  │                     │          │ geofence_lookahead_s seconds, fires a warning-severity      │
+  │                     │          │ precursor. geofence_status=2 = predictive, 1 = breach.      │
+  ├─────────────────────┼──────────┼────────────────────────────────────────────────────────────┤
+  │ BATTERY_FAULT       │ critical │ BatteryState.power_supply_health not in {0=unknown,         │
+  │                     │          │ 1=good}. Codes 2–5 map to: overheat, dead cell,             │
+  │                     │          │ overvoltage, unspecified failure. Toggle via                │
+  │                     │          │ ALERT_BATTERY_HEALTH_FAULT=false for simulators that        │
+  │                     │          │ report spurious codes.                                      │
+  ├─────────────────────┼──────────┼────────────────────────────────────────────────────────────┤
+  │ MOTOR_OVERLOAD      │ warning  │ max(|JointState.effort|) on wheel joints > motor_effort_max │
+  │                     │          │ AND wheel velocity >= 0.1 rad/s, sustained for              │
+  │                     │          │ stall_duration_s. Guards against terrain resistance or      │
+  │                     │          │ mechanical obstruction before a stall develops.             │
+  ├─────────────────────┼──────────┼────────────────────────────────────────────────────────────┤
+  │ VERTICAL_SHOCK      │ warning  │ |IMU_az_current - IMU_az_previous| > vert_shock_ms2.        │
+  │                     │          │ Detects sudden drops, bumps, or being picked up. Delta-     │
+  │                     │          │ based so constant incline does not trigger it.              │
+  ├─────────────────────┼──────────┼────────────────────────────────────────────────────────────┤
+  │ WHEEL_SLIP          │ warning  │ Active cmd_vel (|lin|>0.1) AND wheel velocity > 0.5 rad/s   │
+  │                     │          │ (wheels spinning) BUT Odometry linear velocity < 0.05 m/s  │
+  │                     │          │ (robot not translating), sustained for slip_duration_s.     │
+  │                     │          │ Real-robot ready; Gazebo does not simulate slip by default. │
+  └─────────────────────┴──────────┴────────────────────────────────────────────────────────────┘
+
+  Business benefit: Each alert type targets a distinct failure mode with its own
+  threshold, duration, and sensor source. Operators can tune any individual
+  threshold via .env without touching code.
+
+
+  2.4  ALERT LIFECYCLE: FIRE, DEDUP, CLEAR, RE-FIRE
+  ──────────────────────────────────────────────────
+
+  _fire_alert(robot_idx, alert_type, severity, message, value, threshold)
+
+    Step 1 — Deduplication: if key "{robot_idx}:{alert_type}" is in
+             active_conditions, return immediately. Prevents alert storms while
+             a condition is continuously active.
+
+    Step 2 — Genuine-clear filter: elapsed = now - clear_times[key].
+             If elapsed < genuine_clear_s (default 2s), return. Suppresses
+             rapid oscillation around a threshold (noise) while still allowing
+             a condition that genuinely resolved and re-emerged after 2+ seconds
+             to fire a second time. This replaces the previous flat 10-second
+             cooldown which incorrectly suppressed real re-emergences.
+
+    Step 3 — Fire: add to active_conditions, increment Prometheus counter,
+             build JSON alert dict, append to alert_buffer (deque, maxlen=50),
+             publish to /robot_alerts.
+
+    Step 4 — Auto-stop: if auto_stop_enabled and severity == 'critical',
+             publish zero Twist to that robot's cmd_vel topic immediately.
+
+  _clear_alert(robot_idx, *cond_ids)
+    Removes keys from active_conditions and records clear time in clear_times.
+    Called on the else-branch of each detection block as soon as the condition
+    is no longer met.
+
+  Business benefit: The two-stage fire/clear model means operators see exactly
+  one alert per occurrence without spam, and genuine re-occurrences always
+  produce a fresh alert.
+
+
+  2.5  AUTO-STOP SAFETY FEATURE
+  ──────────────────────────────
+
+  Subscribes to /safety_auto_stop (std_msgs/Bool). When enabled:
+    — Any critical-severity alert immediately publishes Twist(0,0,0) to the
+      affected robot's cmd_vel topic.
+    — Status echoed back on /safety_auto_stop_status for the browser to track.
+
+  The AlertHistory panel shows a toggle button (red=OFF, green=ON). When
+  OFF, alerts are still logged and displayed but no stop command is issued.
+
+  Business benefit: Provides a one-click hardware safety net. Operators can
+  enable it during high-risk operations and disable it during testing without
+  modifying any configuration.
+
+
+  2.6  ALERT HISTORY PERSISTENCE
+  ────────────────────────────────
+
+  In-memory: deque(maxlen=50) — ring buffer of the last 50 alerts.
+
+  On-disk: ALERT_HISTORY_FILE (default /data/alert_history.json, mounted from
+           Docker volume alert-data). Written atomically via a .tmp file and
+           os.replace to avoid corruption on mid-write crash.
+
+  On startup: history loaded from disk. New alerts appended. On SIGTERM,
+              buffer flushed to disk before exit.
+
+  Published every 5 seconds on /robot_alerts_history as a JSON array. Also
+  published on-demand when a message arrives on /robot_alerts_request_history,
+  which the browser sends immediately on rosbridge reconnect.
+
+  Business benefit: Alert history survives both container restarts and browser
+  refreshes. Operators returning after a break see the full recent alert log
+  without needing Grafana.
+
+
+  2.7  NODE HEARTBEAT
+  ────────────────────
+
+  A daemon thread increments robot_alert_node_heartbeat every 5 seconds.
+  Because it is a daemon thread, it terminates with the process under any
+  signal including SIGKILL. Grafana evaluates increase(heartbeat[30s]) and
+  fires the NODE_DOWN alert if fewer than 1 increment is observed in 30 seconds.
+
+  robot_alert_node_up is also set to 1/0 on clean start/shutdown and drives
+  the "Alert Monitor Node Status" stat panel (green UP / red DOWN). This gives
+  an instant visual indicator even before the 30-second heartbeat rule fires.
+
+  Business benefit: Previously a crashed monitoring process was invisible —
+  robots appeared healthy because their last-known metrics were still served
+  by Prometheus. Now a dead monitor is detectable within 30 seconds.
+
+
+  2.8  SIMULATED BATTERY MODEL
+  ──────────────────────────────
+
+  For any robot that has never published a real sensor_msgs/BatteryState
+  message, the node maintains a software-simulated battery updated every
+  second by _update_simulated_battery().
+
+  Starting values (staggered so robots show distinct lines on the chart):
+    Robot 0: 95.0 %
+    Robot 1: 90.0 %
+    Robot 2: 85.0 %
+    Robot N: (95.0 - N × 5.0) %
+
+  Drain rate per second:
+    base:     0.008 %/s   (robot at rest, always applied)
+    velocity: 0.040 × linear_velocity %/s   (proportional to speed)
+
+  Combined:
+    drain = 0.008 + vel × 0.04  %/s
+
+  Representative drain times from full charge (95%):
+    At rest (0 m/s):           95% / 0.008 %/s ≈ 197 minutes (~3.3 h)
+    At max speed (0.50 m/s):   95% / 0.028 %/s ≈  57 minutes (~1 h)
+
+  When a robot starts publishing real BatteryState messages, its index is
+  added to the real_battery set and the simulated drain loop skips it.
+  The simulated percentage is synchronised to the real value on first receipt
+  so the metric transitions smoothly.
+
+  LOW_BATTERY fires from simulated data exactly as it would from real data —
+  the check is the same regardless of source. This means robots in a fresh
+  simulation session will trigger LOW_BATTERY automatically after roughly
+  one hour of high-speed operation without any hardware or ROS battery plugin.
+
+  Business benefit: Operators can evaluate and demonstrate the full alert
+  pipeline including battery alerts in Gazebo without a battery state plugin
+  or physical hardware.
+
+================================================================================
+  3.  PROMETHEUS INTEGRATION
+================================================================================
+
+  3.1  SCRAPE CONFIGURATION
+  ──────────────────────────
+
+  File: monitoring/prometheus/prometheus.yml
+  Target: ros-stack:8888 (alert_monitor_node HTTP server)
+  Interval: 5 seconds
+  Retention: configurable via PROMETHEUS_RETENTION env var (default 30d)
+  Port mapping: host:9091 → container:9090
+
+  Prometheus is the time-series store for all robot and alert metrics. It is
+  scraped by Grafana as the primary datasource (uid: prometheus-ds).
+
+
+  3.2  THRESHOLD GAUGES — SINGLE SOURCE OF TRUTH
+  ────────────────────────────────────────────────
+
+  The five scalar threshold gauges (robot_vel_linear_max, robot_vel_angular_max,
+  robot_battery_pct_min, robot_impact_accel_max, robot_tilt_max_deg) are set
+  from the node's own attributes in main() after AlertMonitorNode is
+  instantiated:
+
+    _thresh_vel_lin_gauge.set(node.vel_linear_max)
+    _thresh_vel_ang_gauge.set(node.vel_angular_max)
+    ...
+
+  Grafana alert rules use scalar() to compare metric vectors against these
+  gauges:
+
+    (robot_velocity_linear > scalar(robot_vel_linear_max)) ...
+
+  This means the same .env value (e.g. ALERT_VEL_LINEAR_MAX=0.3) controls:
+    1. The Python node's detection logic
+    2. The Prometheus threshold gauge value
+    3. The Grafana alert rule evaluation
+
+  Previously Grafana rules had hardcoded literals (> 0.5) which diverged
+  silently if .env was changed. Now there is one source of truth.
+
+================================================================================
+  4.  GRAFANA DASHBOARD  (monitoring/grafana/dashboards/robot_alerts.json)
+================================================================================
+
+  4.0  PROVISIONING FILE STRUCTURE
+  ──────────────────────────────────
+
+  Grafana auto-provisions all configuration from files mounted at container
+  startup. No manual UI setup is required after docker compose up.
+
+  monitoring/grafana/provisioning/
+  ├── datasources/
+  │   └── prometheus.yml       — Registers Prometheus as the default datasource
+  │                               uid: prometheus-ds  (referenced by all panels)
+  │                               url: http://prometheus:9090 (internal Docker network)
+  │                               editable: false — URL cannot be changed from the UI;
+  │                               edit this file and restart grafana to change it.
+  │
+  ├── dashboards/
+  │   └── dashboards.yml       — Tells Grafana where to find dashboard JSON files.
+  │                               folder: "Robot Monitoring" (appears in sidebar)
+  │                               allowUiUpdates: true — edits made in the Grafana UI
+  │                               persist in grafana-storage (SQLite). The JSON file
+  │                               is re-read every updateIntervalSeconds: 10 seconds;
+  │                               changes to robot_alerts.json on disk apply within
+  │                               10s without restarting grafana.
+  │                               disableDeletion: false — dashboards can be deleted
+  │                               from the UI (they reappear on next reload if the
+  │                               JSON file still exists).
+  │
+  └── alerting/
+      └── alert_rules.yml      — Defines contact points, mute timings, routing
+                                  policy, and all Grafana unified alerting rules.
+                                  Changes require docker compose restart grafana.
+                                  The file is read once at startup, not polled.
+
+  Dashboard JSON file:
+    monitoring/grafana/dashboards/robot_alerts.json
+      — The 17-panel dashboard definition. Edited directly for panel changes.
+        Grafana re-reads it within 10 seconds (see updateIntervalSeconds above).
+
+  4.1  TEMPLATE VARIABLE
+  ────────────────────────
+
+  Name: robot_id
+  Query: label_values(robot_connection_status, robot_id)
+  Refresh: on time range change
+  includeAll: true (default = "All")
+
+  Every per-robot panel expr includes {robot_id=~"$robot_id"}. When "All" is
+  selected ($robot_id expands to .*), all robots are shown. When a single robot
+  is selected, all panels simultaneously filter to that robot's data — no
+  per-panel configuration required.
+
+  Business benefit: Operators managing large fleets can isolate one robot's
+  full data profile in a single dropdown selection.
+
+
+  4.2  PANEL INVENTORY
+  ─────────────────────
+
+  Row y=0  (timeseries, full width split):
+    Panel 1 — Min Scan Range (m)
+      Visualises robot_min_scan_range with robot_collision_threshold overlay.
+      Threshold line (red at collision threshold) gives immediate visual
+      context for how close each robot is to triggering an alert.
+
+    Panel 2 — Linear Velocity (m/s)
+      robot_velocity_linear. Threshold line at vel_linear_max.
+
+  Row y=8  (left: timeseries; right: tables):
+    Panel 3 — Battery Percentage (%)
+      robot_battery_percentage. Red at 0%, yellow at 20%, green at 50%.
+      Simulated battery shows staggered starting values (95%, 90%, 85%)
+      for visual distinction between robots.
+
+    Panel 4 — Alerts by Type (last 5m)  [TABLE]
+      floor(sum by (alert_type)(increase(robot_alert_total{...}[5m])))
+      All 12 alert types always present (pre-seeded counters).
+      Sorted by count descending. Color-background green/yellow/red.
+      Fixed column widths: Alert Type 200px, Count 100px.
+
+    Panel 5 — Alerts by Robot (last 5m)  [TABLE]
+      floor(sum by (robot_id)(increase(robot_alert_total{...}[5m])))
+      Robot IDs value-mapped to tb3_0, tb3_1, etc. Sorted ascending.
+
+  Row y=16  (timeseries, full width split):
+    Panel 6 — Horizontal Acceleration (m/s²)
+      robot_imu_accel_horiz. Threshold line at impact_accel_max.
+
+    Panel 7 — Tilt Angle (°)
+      robot_tilt_angle_deg. Threshold line at tilt_max_deg.
+
+  Row y=24  (stat, half width each):
+    Panel 8 — Connection Status
+      robot_connection_status. 1=connected (green), 0=lost (red).
+
+    Panel 9 — Motor Stall Status
+      robot_motor_stall_status. 1=stalling (red), 0=ok (green).
+
+  Row y=28  (timeseries, full width):
+    Panel 10 — Angular Velocity (rad/s)
+      robot_velocity_angular. Full width for clearer multi-robot view.
+
+  Row y=36  (stat + timeseries, half width each):
+    Panel 11 — Geofence Status
+      robot_geofence_status. 0=inside, 1=breach, 2=warning.
+
+    Panel 12 — Geofence Distance (m)
+      robot_geofence_distance_m. Shows distance from origin over time.
+
+  Row y=40  (stat, half width each):
+    Panel 13 — Critical Alerts (last 5m)
+      sum(floor(increase(robot_alert_total{severity="critical",...}[5m])))
+
+    Panel 14 — Warning Alerts (last 5m)
+      sum(floor(increase(robot_alert_total{severity="warning",...}[5m])))
+
+  Row y=44  (stat, full width):
+    Panel 15 — Fleet Health Score (%)
+      100 * count(robot_connection_status == 1) / count(robot_connection_status > -Inf)
+      Aggregate metric — intentionally not filtered by robot_id variable since
+      it represents fleet-wide health, not a per-robot view.
+
+  Row y=48  (table, full width):
+    Panel 16 — Alert Frequency by Robot (24h)
+      sum by (robot_id, alert_type, severity)(increase(robot_alert_total{...}[24h]))
+      Instant query, table format. Sorted by count descending.
+      Shows the full cross-product of robot × alert_type × severity for the
+      last 24 hours. Useful for post-shift trend analysis.
+
+  Row y=56  (stat, full width):
+    Panel 17 — Alert Monitor Node Status
+      robot_alert_node_up. Mapping: 1 → "UP" (green background),
+      0 → "DOWN" (red background). Color-background mode.
+
+
+  4.3  UNIFIED ALERTING RULES
+  ─────────────────────────────
+
+  File: monitoring/grafana/provisioning/alerting/alert_rules.yml
+  Group: robot-thresholds, interval 10s
+
+  All rules follow the same two-refId pattern:
+    refId A — PromQL query against prometheus-ds
+    refId threshold — __expr__ threshold evaluator (type: gt or lt)
+
+  Safety-critical rules use for: 0s (fires immediately on first evaluation):
+    robot-collision-alert     — robot_min_scan_range < robot_collision_threshold
+                                connection-gated
+    robot-tilt-alert          — robot_tilt_angle_deg > scalar(robot_tilt_max_deg)
+                                connection-gated
+    robot-connection-alert    — robot_connection_status == 0
+                                noDataState: Alerting (fires if metric disappears)
+    robot-impact-alert        — robot_imu_accel_horiz > scalar(robot_impact_accel_max)
+                                connection-gated
+
+  Operational rules use for: 10s (requires sustained condition):
+    robot-velocity-alert      — (linear > scalar(max)) or (angular > scalar(max))
+    robot-battery-alert       — battery_percentage < scalar(battery_pct_min)
+    robot-geofence-alert      — robot_geofence_status > 0
+    robot-stall-alert         — robot_motor_stall_status > 0
+    robot-brownout-risk-alert — imu_accel_horiz > 6 AND battery_percentage < 30
+                                execErrState: OK (composite rule, not safety-critical)
+
+  Monitoring rule uses for: 30s:
+    robot-monitor-node-alert  — increase(robot_alert_node_heartbeat[30s]) < 1
+                                noDataState: Alerting, execErrState: Alerting
+                                Fires when heartbeat counter stops incrementing.
+
+  Business benefit: Safety-critical conditions (collision, tilt, connection loss)
+  fire Grafana webhooks immediately. Slower-developing conditions use a 10-second
+  pending period to avoid webhook noise from transient sensor glitches.
+
+
+  4.4  CONTACT POINTS AND ROUTING
+  ─────────────────────────────────
+
+  Two contact points:
+    alert-webhook — Generic HTTP POST (default: Prometheus health-check as no-op).
+                    Replace URL via Grafana UI (Alerting → Contact points) to
+                    point at Slack, PagerDuty, or any HTTP endpoint.
+    discord       — Native Grafana Discord contact point. Replace URL to activate.
+
+  Routing policy:
+    Root route   → alert-webhook (all alerts)
+    Child route  → discord (all alerts, continue: false)
+    group_by: [robot_id, alert_type]
+    group_wait: 30s, group_interval: 5m, repeat_interval: 12h
+
+  Business benefit: All alerts go to both channels simultaneously. Grouping by
+  robot_id and alert_type prevents notification floods when multiple thresholds
+  fire at once for the same robot.
+
+
+  4.5  MAINTENANCE WINDOW
+  ────────────────────────
+
+  muteTimings entry "maintenance-window" is defined with time_intervals: [].
+  To activate: add schedule entries and restart grafana.
+  To deactivate: clear time_intervals and restart grafana.
+
+  Example activation (weekend nights):
+    time_intervals:
+      - times:
+          - start_time: '22:00'
+            end_time:   '06:00'
+        weekdays: ['saturday', 'sunday']
+
+================================================================================
+  5.  REACT ALERTHISTORY COMPONENT
+      (src/components/dashboard/AlertHistory.tsx)
+================================================================================
+
+  5.1  REAL-TIME ALERT RECEPTION
+  ────────────────────────────────
+
+  Subscribes to two ROS topics via rosbridge WebSocket (ws://localhost:9090):
+
+    /robot_alerts         — single JSON alert per message, fired by the node
+                            on every new alert occurrence.
+    /robot_alerts_history — JSON array of up to 50 recent alerts, broadcast
+                            every 5 seconds and on-demand on reconnect.
+
+  Incoming alerts are parsed and prepended to local state (newest first),
+  capped at MAX_ALERTS = 50. Duplicate detection: history messages filter
+  against existing alert IDs before merging.
+
+
+  5.2  RECONNECT RECOVERY
+  ─────────────────────────
+
+  A useEffect monitors isConnected transitions. On false → true:
+
+    publish('/robot_alerts_request_history', 'std_msgs/String', { data: '' })
+
+  The Python node responds immediately with the full alert buffer. This
+  eliminates the up-to-5-second wait for the next periodic broadcast and
+  ensures alerts generated during the disconnection window are recovered
+  as soon as the socket is re-established.
+
+  A separate useEffect tracks disconnection windows (disconnectTimeRef).
+  On reconnect, counts how many alerts arrived while offline and displays
+  a banner: "Reconnected — N alerts received while offline."
+
+  Business benefit: Operators who lose network connectivity briefly do not
+  miss alerts. The recovery is automatic and immediate.
+
+
+  5.3  BROWSER PERSISTENCE
+  ──────────────────────────
+
+  Alert list and acknowledged IDs are stored in localStorage under:
+    rosviz_alerts     — JSON array of AlertMessage objects
+    rosviz_acknowledged — JSON array of acknowledged alert IDs
+
+  Written on every state change via safeSetItem(), which handles
+  QuotaExceededError by evicting acknowledged alerts older than the newest
+  10, then retrying. Alerts survive browser refresh and tab closure.
+
+  Business benefit: Operators returning to the dashboard after a break see
+  the full recent alert log without needing to query Grafana or wait for the
+  next history broadcast.
+
+
+  5.4  FILTERING, SORTING, AND ACKNOWLEDGEMENT
+  ──────────────────────────────────────────────
+
+  Display order: critical alerts always above warnings, then sorted by
+  timestamp descending within each severity group.
+
+  Filters:
+    Severity — All / CRIT / WARN buttons
+    Robot    — dropdown populated from unique robot IDs in the alert list,
+               showing tb3_N names. Scales to any fleet size.
+
+  Header counters: Crit(total)(unacked) Warn(total)(unacked)
+    Unacked counts are bold, giving operators an immediate sense of how many
+    issues still need attention.
+
+  Acknowledgement:
+    Per-alert ✓ button (green) marks an alert as acknowledged (opacity 40%).
+    "Ack all" button acknowledges all currently visible (filtered) alerts.
+    "Clear" button removes all alerts and acknowledged IDs.
+
+  Business benefit: Operators can confirm they have seen each alert without
+  removing it from the log, maintaining an audit trail for the session.
+
+
+  5.5  AUTO-STOP TOGGLE
+  ──────────────────────
+
+  Button states: OFF (red) / ON (green)
+  Publishes to /safety_auto_stop (std_msgs/Bool) on click.
+  Subscribes to /safety_auto_stop_status to stay in sync with server state.
+  Disabled (opacity 40%) when rosbridge is disconnected.
+
+  When ON: the Python node issues Twist(0,0,0) to any robot that triggers a
+           critical alert.
+
+
+  5.6  CRITICAL FLASH
+  ─────────────────────
+
+  When a new critical-severity alert arrives, the panel border transitions to
+  red (border-red-500) for 2 seconds then fades back to the default dark border
+  (border-[#2a2a2a]) via Tailwind's transition-colors duration-500 class.
+
+  A useRef (flashTimeoutRef) tracks the active timeout and clears it on
+  component unmount or if a second critical arrives before the first flash ends.
+
+  Business benefit: Operators focused on the map or camera feed get a
+  peripheral visual cue without requiring an audio alarm.
+
+================================================================================
+  6.  CONFIGURATION REFERENCE  (.env.example)
+================================================================================
+
+  All thresholds are overridable at container startup via environment variables.
+  Copy .env.example to .env and edit before running docker compose up.
+
+  Fleet:
+    TURTLEBOT3_MODEL=waffle       # burger | waffle | waffle_pi
+    NUM_ROBOTS=3                  # number of simulated robots (0-indexed)
+
+  Collision:
+    ALERT_SCAN_MIN_M              # override auto-computed footprint threshold
+    ALERT_SCAN_MARGIN_M=0.05      # metres added to corner radius
+    ALERT_SCAN_REACTION_S=0.5     # velocity lookahead window (s)
+
+  Velocity:
+    ALERT_VEL_LINEAR_MAX=0.50     # m/s
+    ALERT_VEL_ANGULAR_MAX=2.00    # rad/s
+
+  Connection:
+    ALERT_CONN_TIMEOUT_S=5.0      # seconds of silence before CONNECTION_LOSS
+
+  Re-fire:
+    ALERT_REFIRE_COOLDOWN_S=10.0  # legacy reference (superseded)
+    ALERT_GENUINE_CLEAR_S=2.0     # seconds absent before re-trigger is genuine
+
+  Battery:
+    ALERT_BATTERY_PCT_MIN=20.0    # percent
+    ALERT_BATTERY_VOLT_MIN=10.5   # volts
+
+  IMU:
+    ALERT_IMPACT_ACCEL_MS2=8.0    # m/s² horizontal — IMPACT_DETECTED
+    ALERT_TILT_DEG=20.0           # degrees roll/pitch — TILT_WARNING
+    ALERT_VERTICAL_SHOCK_MS2=5.0  # m/s² vertical delta — VERTICAL_SHOCK
+
+  Motor:
+    ALERT_STALL_DURATION_S=2.0    # seconds stalled before MOTOR_STALL
+    ALERT_MOTOR_EFFORT_MAX=1.0    # N·m — MOTOR_OVERLOAD
+
+  Geofence:
+    ALERT_GEOFENCE_X_MIN=-5.0     # metres
+    ALERT_GEOFENCE_X_MAX=5.0
+    ALERT_GEOFENCE_Y_MIN=-5.0
+    ALERT_GEOFENCE_Y_MAX=5.0
+    ALERT_GEOFENCE_LOOKAHEAD_S=5.0 # predictive boundary warning window (s)
+
+  Battery health / wheel slip:
+    ALERT_BATTERY_HEALTH_FAULT=true   # false = ignore health codes in sim
+    ALERT_SLIP_DURATION_S=2.0         # seconds of cmd/odom mismatch — WHEEL_SLIP
+
+  Persistence:
+    ALERT_HISTORY_FILE=/data/alert_history.json
+
+  Notifications:
+    ALERT_WEBHOOK_URL=http://prometheus:9090/-/healthy  # override with real URL
+    DISCORD_WEBHOOK_URL=                               # empty = disabled
+
+  Prometheus:
+    PROMETHEUS_RETENTION=30d
+
+  Grafana:
+    GRAFANA_ADMIN_USER=admin
+    GRAFANA_ADMIN_PASSWORD=admin
+
+================================================================================
+  7.  DOCKER COMPOSE SERVICE MAP
+================================================================================
+
+  ros-stack   (rosviz-ros)
+    Build: docker/Dockerfile.ros
+    Ports: 9090 (rosbridge WebSocket), 8888 (Prometheus scrape, internal)
+    Volumes: ./simulation, ./scripts (hot-reload), alert-data (persistence)
+    Restart: unless-stopped
+    Health: curl http://localhost:8888/metrics every 10s
+    Contains: Gazebo Fortress, ROS 2, rosbridge, alert_monitor_node.py
+
+  dashboard   (rosviz-dashboard)
+    Build: docker/Dockerfile.dashboard
+    Port: 3000
+    Volumes: ./src, ./public (Next.js hot-reload)
+    Depends on: ros-stack (healthy)
+    Restart: unless-stopped
+
+  prometheus  (rosviz-prometheus)
+    Image: prom/prometheus:v2.52.0
+    Port: 9091 → 9090
+    Volumes: prometheus-data, prometheus.yml, alert_rules.yml (read-only)
+    Depends on: ros-stack (healthy)
+    Restart: unless-stopped
+
+  grafana     (rosviz-grafana)
+    Image: grafana/grafana-oss:10.4.2
+    Port: 3001 → 3000
+    Volumes: provisioning/ (read-only), dashboards/ (read-only), grafana-storage
+    Depends on: prometheus (healthy)
+    Restart: unless-stopped
+    Provisioning: datasources, dashboards, alerting (contact points, rules,
+                  mute timings, notification policies)
+
+  Volumes: grafana-storage, alert-data, prometheus-data
+           (all persistent across container restarts)
+
+================================================================================
+  8.  END-TO-END ALERT FLOW
+================================================================================
+
+  Example: Robot 1 approaches an obstacle.
+
+  1. Gazebo publishes LaserScan on /tb3_1/scan at ~10 Hz.
+
+  2. alert_monitor_node._on_scan() receives the message.
+     — last_msg_time[1] updated (resets connection watchdog).
+     — Forward arc scanned for minimum range.
+     — Velocity-adjusted threshold computed.
+     — Min range < threshold: _fire_alert(1, 'COLLISION', 'critical', ...) called.
+
+  3. _fire_alert():
+     — Key "1:COLLISION" not in active_conditions → proceed.
+     — clear_times["1:COLLISION"] was 0 (never cleared) → elapsed > genuine_clear_s → proceed.
+     — Adds "1:COLLISION" to active_conditions.
+     — Increments robot_alert_total{robot_id="1", alert_type="COLLISION", severity="critical"}.
+     — Appends alert dict to alert_buffer.
+     — Publishes JSON to /robot_alerts.
+     — If auto_stop_enabled: publishes Twist(0,0,0) to /tb3_1/cmd_vel.
+
+  4. rosbridge forwards /robot_alerts to all WebSocket subscribers.
+     AlertHistory.tsx receives the JSON, parses it, prepends to state.
+     If critical: panel border flashes red for 2 seconds.
+     Unacknowledged critical count increments in the header.
+
+  5. Prometheus scrapes :8888 within 5 seconds.
+     robot_alert_total{robot_id="1", alert_type="COLLISION"} is now 1.
+     robot_min_scan_range{robot_id="1"} shows the triggering value.
+
+  6. Grafana evaluates robot-collision-alert rule (interval: 10s, for: 0s).
+     PromQL: robot_min_scan_range{robot_id=~".*"} < robot_collision_threshold
+             and on(robot_id) (robot_connection_status == 1)
+     Condition met on first evaluation → alert fires immediately (for: 0s).
+     Notification sent to alert-webhook contact point.
+     If Discord configured: message sent to Discord channel.
+
+  7. Robot moves away from obstacle. LaserScan min range rises above threshold.
+     _on_scan() calls _clear_alert(1, 'COLLISION').
+     "1:COLLISION" removed from active_conditions.
+     clear_times["1:COLLISION"] = now.
+
+  8. If Robot 1 approaches a second obstacle 3 seconds later (> genuine_clear_s):
+     _fire_alert() sees elapsed=3s >= genuine_clear_s=2s → fires a new alert.
+     A second webhook notification is sent.
+
+================================================================================
+  9.  ROBUSTNESS PROPERTIES AND DESIGN DECISIONS
+================================================================================
+
+  PROPERTY                   MECHANISM
+  ─────────────────────────  ─────────────────────────────────────────────────
+  No alert spam              active_conditions set prevents re-fire while
+                             condition is continuously active.
+
+  No suppressed re-emergence genuine_clear_s (2s) replaces the previous 10s
+                             flat cooldown. Noise oscillations are suppressed;
+                             real re-entries after 2s always fire.
+
+  Connection-gated rules     All Grafana PromQL rules include:
+                               and on(robot_id) (robot_connection_status == 1)
+                             Prevents false positives from stale metrics after
+                             a robot goes offline.
+
+  Threshold single source    Scalar threshold gauges published by Python node.
+  of truth                   Grafana uses scalar() to compare against them.
+                             .env change propagates to both systems atomically.
+
+  Brief spike detection      Safety-critical Grafana rules use for: 0s.
+                             A collision that resolves in 3s still triggers a
+                             webhook. Previously for: 10s would miss it.
+
+  Dead monitor detection     Heartbeat counter stops on SIGKILL. Grafana fires
+                             NODE_DOWN within 30s via increase(heartbeat[30s]).
+                             Covers OOM kills and docker kill scenarios.
+
+  Process auto-restart       ros-stack has restart: unless-stopped.
+                             On crash, Docker restarts the container, node
+                             re-initialises, heartbeat resumes.
+
+  Reconnect alert recovery   Browser publishes /robot_alerts_request_history
+                             immediately on rosbridge reconnect. Python responds
+                             with full buffer. No missed alerts from brief drops.
+
+  History on crash           alert_history.json written atomically. Loaded on
+                             restart. Alert buffer survives container restarts.
+
+  Browser quota safety       safeSetItem() catches QuotaExceededError and evicts
+                             acknowledged alerts before retrying. Dashboard never
+                             throws on low-storage devices.
+
+  Per-callback isolation     rosbridge.ts wraps each subscription callback in
+                             try/catch. A bug in one component's message handler
+                             cannot crash other subscriptions.
+
+  Grafana edit persistence   allowUiUpdates: true in dashboards.yml provisioning.
+                             In-UI dashboard edits persist in Grafana's SQLite
+                             DB. They are overwritten only if the JSON file
+                             itself changes in a subsequent deployment.
+
+================================================================================
+  10.  USER GUIDE — HOW TO USE THE ALERT SYSTEM
+================================================================================
+
+  10.1  STARTING THE STACK
+  ──────────────────────────
+
+  Prerequisites: Docker Desktop running, ports 3000, 3001, 9090, 9091 free.
+
+  1. (First time) Copy the example env file:
+       cp .env.example .env
+
+  2. Edit .env if you want to change thresholds or fleet size (see section 6).
+     Defaults work out of the box for a 3-robot Waffle simulation.
+
+  3. Start all services:
+       docker compose up --build
+
+     Or, after an initial build, start without rebuilding:
+       docker compose up
+
+  4. Wait ~30 seconds for Gazebo and ROS to fully initialise.
+     All four services should report healthy in the Docker Desktop dashboard.
+
+  To restart a single service after a config change:
+       docker compose restart grafana
+       docker compose restart ros-stack
+
+  To stop everything:
+       docker compose down
+
+
+  10.2  ACCESSING THE INTERFACES
+  ────────────────────────────────
+
+  ROSViz Dashboard (robot telemetry + AlertHistory panel):
+    http://localhost:3000
+
+  Grafana (metrics dashboards + alert rules):
+    http://localhost:3001
+    Username: admin
+    Password: admin   (change via GRAFANA_ADMIN_PASSWORD in .env)
+
+  Prometheus (raw metrics query / scrape health):
+    http://localhost:9091
+
+
+  10.3  USING THE ALERTHISTORY PANEL (Dashboard)
+  ─────────────────────────────────────────────────
+
+  The AlertHistory panel appears in the right column of the main dashboard at
+  http://localhost:3000. It connects automatically to rosbridge on load.
+
+  CONNECTION INDICATOR
+    The small dot next to "Alert History" shows WebSocket status:
+      ● Green (pulsing) — connected to rosbridge, receiving live data
+      ● Red (solid)     — disconnected; alerts will be recovered on reconnect
+
+  READING THE ALERT LIST
+    Each alert card shows:
+      [CRIT/WARN badge]  [alert message]
+                          Robot N · HH:MM:SS
+                          [measured value / threshold]
+
+    Alerts are sorted: critical first, then warnings, newest at the top
+    within each severity group. Acknowledged alerts fade to 40% opacity
+    and sink to the bottom of their group.
+
+  SEVERITY FILTER
+    Use the All / CRIT / WARN buttons to narrow the list.
+
+  ROBOT FILTER
+    Use the "All robots" dropdown to focus on one robot (tb3_0, tb3_1, ...).
+    The dropdown populates automatically from the robots that have generated
+    alerts — no configuration needed.
+
+  ACKNOWLEDGING ALERTS
+    Click the green ✓ button on any alert to mark it as seen.
+    "Ack all" acknowledges every alert visible under the current filter.
+    Acknowledged alerts persist across page refreshes (localStorage).
+
+  CLEARING HISTORY
+    "Clear" removes all alerts and acknowledgements from the browser.
+    The Python node's history buffer is not affected — alerts will reappear
+    on the next /robot_alerts_history broadcast (within 5 seconds).
+
+  COUNTER BADGES (header row)
+    Crit(total)(unacked) Warn(total)(unacked)
+    The bold number is unacknowledged count. Use this to confirm that all
+    issues for a shift have been reviewed.
+
+  GRAFANA LINK
+    The "Grafana ↗" link in the top-right opens http://localhost:3001 in a
+    new tab, taking you directly to the persistent metrics dashboard.
+
+  AUTO-STOP TOGGLE
+    "Auto-stop OFF" (red) / "Auto-stop ON" (green)
+    When ON: any incoming critical alert immediately sends a stop command
+    (Twist 0,0,0) to the affected robot. Use during high-risk operations.
+    The button is greyed out when rosbridge is disconnected.
+
+
+  10.4  USING THE GRAFANA DASHBOARD
+  ────────────────────────────────────
+
+  Open:  http://localhost:3001
+  Navigate to:  Dashboards → Robot Alert Monitor
+    (or: Home → Dashboards → Robot Alert Monitor in the left sidebar)
+
+  SELECTING A ROBOT
+    The "robot_id" dropdown at the top of the dashboard filters all panels
+    simultaneously. Options:
+      All      — show all robots overlaid on each panel
+      0        — show only tb3_0
+      1        — show only tb3_1
+      2        — show only tb3_2
+
+    Click the variable box labelled "robot_id" in the top bar to change it.
+
+  TIME RANGE
+    Use the time picker in the top-right corner (default: last 5 minutes).
+    For post-shift analysis, switch to "Last 6 hours" or "Last 24 hours" —
+    Panel 16 (Alert Frequency by Robot) is designed for this longer view.
+
+  KEY PANELS AT A GLANCE
+    Panel 1  — Min Scan Range: watch for values near the red threshold line
+    Panel 3  — Battery: staggered 95/90/85% start for 3 robots; alert fires
+               when any robot drops below ALERT_BATTERY_PCT_MIN (default 20%)
+    Panel 4  — Alerts by Type: sorted by recent count; all 12 types are always
+               shown even if count is 0 (pre-seeded counters)
+    Panel 8  — Connection Status: should stay green; turns red on timeout
+    Panel 17 — Alert Monitor Node Status: should always show "UP" in green
+
+  CHECKING ACTIVE GRAFANA ALERTS
+    Left sidebar → Alerting → Alert rules
+    Each rule shows its current state:
+      Normal    — condition not met
+      Pending   — condition met but for: window not yet elapsed
+      Firing    — alert is active, notifications sent
+      NoData    — no metrics returned (treated as Alerting for critical rules)
+
+  MODIFYING CONTACT POINTS (webhook / Discord)
+    Left sidebar → Alerting → Contact points
+    Click "alert-webhook" → Edit → paste your Slack/PagerDuty/custom URL
+    Click "discord" → Edit → paste your Discord webhook URL
+    Save. Changes take effect immediately (no container restart needed).
+
+  ACTIVATING THE MAINTENANCE WINDOW (silence alerts during downtime)
+    Method 1 — via Grafana UI:
+      Left sidebar → Alerting → Mute timings → maintenance-window → Edit
+      Add a time interval with your desired schedule → Save
+    Method 2 — via YAML (persisted in provisioning):
+      Edit monitoring/grafana/provisioning/alerting/alert_rules.yml
+      Populate the time_intervals block under "maintenance-window"
+      Run: docker compose restart grafana
+
+  REFRESHING THE DASHBOARD AUTOMATICALLY
+    Click the refresh dropdown (top-right, next to the time picker).
+    Set to "10s" for live monitoring during an active operation.
+
+
+  10.5  VERIFYING PROMETHEUS METRICS
+  ────────────────────────────────────
+
+  Open:  http://localhost:9091
+
+  SCRAPE HEALTH
+    Status → Targets
+    The "ros-stack:8888" target should show State=UP.
+    If DOWN: check that the ros-stack container is running and healthy.
+
+  QUERY EXAMPLES
+    Click "Graph" or use the search box on the home page:
+
+    All active connection statuses:
+      robot_connection_status
+
+    Current collision threshold per robot:
+      robot_collision_threshold
+
+    Alert count by type in the last 5 minutes:
+      floor(sum by (alert_type)(increase(robot_alert_total[5m])))
+
+    Confirm threshold gauges match your .env values:
+      robot_vel_linear_max
+      robot_battery_pct_min
+      robot_tilt_max_deg
+      robot_impact_accel_max
+      robot_vel_angular_max
+
+    Node heartbeat (should be rising; 0 = monitor dead):
+      increase(robot_alert_node_heartbeat[30s])
+
+
+  10.6  CHANGING THRESHOLDS
+  ──────────────────────────
+
+  1. Edit .env (copy from .env.example if it does not exist):
+
+       ALERT_VEL_LINEAR_MAX=0.3    # lower the velocity limit to 0.3 m/s
+       ALERT_BATTERY_PCT_MIN=25    # raise the low-battery warning threshold
+
+  2. Restart ros-stack to pick up the new values:
+       docker compose restart ros-stack
+
+  3. Verify in Prometheus (http://localhost:9091):
+       robot_vel_linear_max     → should now return 0.3
+       robot_battery_pct_min    → should now return 25
+
+  4. Grafana alert rules automatically use the updated gauge values via
+     scalar(robot_vel_linear_max) — no YAML edit required.
+
+  Note: geofence boundaries (ALERT_GEOFENCE_X_MIN etc.) are used only by the
+  Python node. They do not have a corresponding Prometheus gauge, so Grafana's
+  geofence rule checks robot_geofence_status (already evaluated by the node).
+
+
+  10.7  ADJUSTING FLEET SIZE
+  ────────────────────────────
+
+  1. Set NUM_ROBOTS in .env:
+       NUM_ROBOTS=5
+
+  2. Rebuild and restart ros-stack:
+       docker compose up --build ros-stack
+
+  3. In Grafana, click the robot_id variable dropdown at the top of the
+     dashboard — new robot IDs will appear automatically. The Prometheus
+     template variable uses label_values(robot_connection_status, robot_id)
+     which discovers all robot IDs dynamically.
+
+  4. No Grafana JSON or alert rule changes are needed — all exprs use the
+     robot_id=~"$robot_id" label matcher which covers any number of robots.
+
+
+  10.8  TROUBLESHOOTING
+  ──────────────────────
+
+  No alerts appearing in AlertHistory panel
+    □ Check the connection dot — red means rosbridge is unreachable.
+    □ Verify ros-stack is running: docker compose ps
+    □ Open browser devtools (F12) → Console for WebSocket errors.
+    □ Confirm rosbridge is on port 9090: docker compose logs ros-stack | grep rosbridge
+
+  Grafana shows "No data" on all panels
+    □ Check Prometheus scrape health: http://localhost:9091/targets
+    □ Confirm ros-stack health: docker compose ps (Status should be "healthy")
+    □ Query Prometheus directly: robot_connection_status — if empty, metrics
+      are not being scraped yet. Wait 10 seconds and retry.
+
+  Grafana contact points not sending notifications
+    □ Verify URL is set: Alerting → Contact points → alert-webhook → Edit
+    □ Default URL (http://prometheus:9090/-/healthy) is a no-op placeholder.
+    □ Use "Test" button in the contact point editor to send a test notification.
+
+  Alert Monitor Node Status shows "DOWN" in Grafana
+    □ The Python monitoring process has crashed or lost its heartbeat.
+    □ Check logs: docker compose logs ros-stack | grep alert_monitor
+    □ Restart: docker compose restart ros-stack
+    □ Alert will clear within one 10-second evaluation interval after restart.
+
+  Duplicate alerts firing rapidly
+    □ If the same alert fires more than once per 2 seconds, check
+      ALERT_GENUINE_CLEAR_S in .env (default 2.0).
+    □ Increase to suppress threshold oscillation:
+        ALERT_GENUINE_CLEAR_S=5.0
+
+  Geofence alerts firing immediately at startup
+    □ Robots spawn at origin; if geofence bounds are very tight they may
+      breach immediately. Widen bounds in .env:
+        ALERT_GEOFENCE_X_MIN=-10.0
+        ALERT_GEOFENCE_X_MAX=10.0
+        ALERT_GEOFENCE_Y_MIN=-10.0
+        ALERT_GEOFENCE_Y_MAX=10.0
+    □ Or disable predictive mode by setting:
+        ALERT_GEOFENCE_LOOKAHEAD_S=0.0
+
+================================================================================
+  11.  COMPLETE ROS TOPIC REFERENCE
+================================================================================
+
+  All topics are catalogued in src/lib/rosTopics.ts. The table below covers
+  every topic active in the current stack, showing the full resolved path
+  (with tb3_i meaning the pattern repeats for each robot index), message type,
+  direction relative to alert_monitor_node.py, and which component owns it.
+
+  KEY:  SUB = alert_monitor_node subscribes
+        PUB = alert_monitor_node publishes
+        UI  = Next.js dashboard subscribes/publishes via rosbridge
+
+  ┌────────────────────────────────────────────┬──────────────────────────────┬──────┬──────────────────────────────┐
+  │ Topic                                       │ Message Type                 │ Dir  │ Owner / Notes                │
+  ├────────────────────────────────────────────┼──────────────────────────────┼──────┼──────────────────────────────┤
+  │ /tb3_i/scan                                 │ sensor_msgs/LaserScan        │ SUB  │ Gazebo → collision detection │
+  │ /tb3_i/odom                                 │ nav_msgs/Odometry            │ SUB  │ Gazebo → velocity/geofence   │
+  │ /tb3_i/imu                                  │ sensor_msgs/Imu              │ SUB  │ Gazebo → tilt/impact/shock   │
+  │ /tb3_i/battery_state                        │ sensor_msgs/BatteryState     │ SUB  │ Gazebo → battery/fault       │
+  │ /tb3_i/cmd_vel                              │ geometry_msgs/Twist          │ SUB  │ Nav stack → stall/slip gates │
+  │ /tb3_i/cmd_vel                              │ geometry_msgs/Twist          │ PUB  │ Auto-stop zero command       │
+  │ /tb3_i/joint_states                         │ sensor_msgs/JointState       │ SUB  │ Gazebo → stall/overload/slip │
+  ├────────────────────────────────────────────┼──────────────────────────────┼──────┼──────────────────────────────┤
+  │ /robot_alerts                               │ std_msgs/String (JSON)       │ PUB  │ One alert per fire event     │
+  │ /robot_alerts_history                       │ std_msgs/String (JSON array) │ PUB  │ Full buffer, every 5s        │
+  │ /robot_alerts_request_history               │ std_msgs/String              │ SUB  │ Triggers immediate history   │
+  │ /safety_auto_stop                           │ std_msgs/Bool                │ SUB  │ Command from UI toggle       │
+  │ /safety_auto_stop_status                    │ std_msgs/Bool                │ PUB  │ Echo for UI sync             │
+  ├────────────────────────────────────────────┼──────────────────────────────┼──────┼──────────────────────────────┤
+  │ /tb3_i/scan                                 │ sensor_msgs/LaserScan        │ UI   │ LiDAR visualisation (map)    │
+  │ /tb3_i/scan/points                          │ sensor_msgs/PointCloud2      │ UI   │ 3-D point cloud overlay      │
+  │ /tb3_i/odom                                 │ nav_msgs/Odometry            │ UI   │ Robot pose on map            │
+  │ /tb3_i/imu                                  │ sensor_msgs/Imu              │ UI   │ Orientation display          │
+  │ /tb3_i/battery_state                        │ sensor_msgs/BatteryState     │ UI   │ Battery widget               │
+  │ /tb3_i/camera/image_raw/compressed          │ sensor_msgs/CompressedImage  │ UI   │ Camera feed                  │
+  │ /tb3_i/camera/depth/image_rect_raw/compressed│ sensor_msgs/CompressedImage  │ UI   │ Depth camera overlay         │
+  │ /tb3_i/joint_states                         │ sensor_msgs/JointState       │ UI   │ Wheel speed display          │
+  │ /tb3_i/cmd_vel                              │ geometry_msgs/Twist          │ UI   │ Teleoperation publish        │
+  ├────────────────────────────────────────────┼──────────────────────────────┼──────┼──────────────────────────────┤
+  │ /tf                                         │ tf2_msgs/TFMessage           │ UI   │ Transform tree (map frames)  │
+  │ /tf_static                                  │ tf2_msgs/TFMessage           │ UI   │ Static transforms            │
+  ├────────────────────────────────────────────┼──────────────────────────────┼──────┼──────────────────────────────┤
+  │ /selected/scan_points                       │ sensor_msgs/PointCloud2      │ UI   │ Mux output: active robot     │
+  │ /selected/camera_image                      │ sensor_msgs/CompressedImage  │ UI   │ Mux output: active robot cam │
+  │ /selected/camera_depth                      │ sensor_msgs/CompressedImage  │ UI   │ Mux output: active robot depth│
+  └────────────────────────────────────────────┴──────────────────────────────┴──────┴──────────────────────────────┘
+
+  Note: perRobot: true topics are subscribed/published under /tb3_<robotId>/
+  by the useROS hook when a robotId is passed. The alert topics and safety
+  topics are fleet-wide (perRobot: false) and have no robot-specific prefix.
+
+  Collision condition IDs (internal dedup keys, not exposed externally):
+    The COLLISION alert type uses five internal condition IDs rather than one:
+      COLLISION_FWD_CRIT  — obstacle in forward ±45° arc below critical threshold
+      COLLISION_FWD_WARN  — obstacle in forward ±45° arc below warning threshold
+      COLLISION_REAR_CRIT — obstacle in rear ±45° arc below critical threshold
+      COLLISION_REAR_WARN — obstacle in rear ±45° arc while reversing
+      COLLISION_SIDE      — obstacle on sides below base threshold
+    This allows independent fire/clear cycles per zone so a rear obstacle can
+    clear without affecting an active forward collision condition.
+
+================================================================================
+  12.  ALERTMESSAGE JSON SCHEMA AND ALERT ID FORMAT
+================================================================================
+
+  Every alert published on /robot_alerts and stored in alert_history.json is
+  a single JSON object with this exact structure:
+
+  {
+    "id":         "3f2504e0-4f89-11d3-9a0c-0305e82c3301",  // UUID v4 string
+    "timestamp":  1716489600.123456,                        // Unix epoch (float, seconds)
+    "robot_id":   1,                                        // integer (0-indexed)
+    "alert_type": "COLLISION",                              // see AlertType enum below
+    "severity":   "critical",                               // "critical" | "warning"
+    "message":    "tb3_1: obstacle ahead at 0.18 m",        // human-readable string
+    "value":      0.18,                                     // measured value (units per type)
+    "threshold":  0.27                                      // threshold that was breached
+  }
+
+  ALERT ID
+    Generated by Python's uuid.uuid4() — a cryptographically random UUID v4.
+    Format: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx  (RFC 4122, lowercase hex)
+    Example: "7f3c21a0-b4d9-4e1f-a832-d9c1e85f30aa"
+    IDs are unique across all robots and sessions. They are used as:
+      — deduplication keys in the browser's localStorage acknowledged set
+      — merge keys when history messages are integrated into browser state
+      — primary key in alert_history.json entries
+
+  ALERT TYPES (AlertType union, src/types/ros.ts)
+    'COLLISION' | 'VELOCITY_EXCEEDED' | 'CONNECTION_LOSS' | 'LOW_BATTERY'
+    'IMPACT_DETECTED' | 'TILT_WARNING' | 'MOTOR_STALL' | 'GEOFENCE_BREACH'
+    'BATTERY_FAULT' | 'MOTOR_OVERLOAD' | 'VERTICAL_SHOCK' | 'WHEEL_SLIP'
+
+  VALUE AND THRESHOLD UNITS BY ALERT TYPE
+    COLLISION           value = scan range (m),     threshold = dynamic crit threshold (m)
+    VELOCITY_EXCEEDED   value = max(|lin|, |ang|),  threshold = max(vel_linear_max, vel_angular_max)
+    CONNECTION_LOSS     value = seconds silent,      threshold = conn_timeout_s
+    LOW_BATTERY         value = percentage (%),      threshold = bat_pct_min (%)
+    IMPACT_DETECTED     value = horiz accel (m/s²),  threshold = impact_accel_ms2
+    TILT_WARNING        value = max(|roll|,|pitch|)°,threshold = tilt_deg_max (°)
+    MOTOR_STALL         value = wheel vel (rad/s),   threshold = 0.1 (stall threshold)
+    GEOFENCE_BREACH     value = distance from origin (m), threshold = 0.0 (breach=any positive)
+    BATTERY_FAULT       value = health code (int),   threshold = 1.0 (1=good)
+    MOTOR_OVERLOAD      value = max effort (N·m),    threshold = motor_effort_max
+    VERTICAL_SHOCK      value = |Δaz| (m/s²),        threshold = vert_shock_ms2
+    WHEEL_SLIP          value = wheel vel (rad/s),   threshold = odom linear vel (m/s)
+
+  GRAFANA WEBHOOK PAYLOAD
+    Grafana sends HTTP POST to the alert-webhook contact point URL using its
+    standard unified alerting payload:
+    {
+      "alerts": [
+        {
+          "status": "firing",
+          "labels": { "robot_id": "1", "alert_type": "COLLISION", "severity": "critical" },
+          "annotations": { "summary": "Robot 1: collision risk",
+                           "description": "Min scan range 0.18 m" },
+          "startsAt": "2024-05-20T12:34:56Z",
+          "endsAt":   "0001-01-01T00:00:00Z",
+          "fingerprint": "abc123..."
+        }
+      ],
+      "commonLabels": { ... },
+      "title": "[FIRING:1] Robot Collision Risk"
+    }
+    This is the standard Grafana Alertmanager-compatible format. Use it to
+    integrate with any HTTP endpoint (Slack, PagerDuty, custom log ingestion).
+
+================================================================================
+  13.  DEVELOPER GUIDE — ADDING A NEW ALERT TYPE
+================================================================================
+
+  Adding a 13th alert type requires changes in 4–6 files depending on whether
+  a Grafana rule and threshold gauge are needed. Follow these steps in order.
+
+  STEP 1 — Register the type and severity in alert_monitor_node.py
+  ────────────────────────────────────────────────────────────────
+
+  In the _ALERT_SEVERITIES dict at the top of the file, add one line:
+
+    'YOUR_ALERT_TYPE': 'warning',   # or 'critical'
+
+  This pre-seeds the Prometheus counter for all robots at startup so the type
+  appears in Grafana immediately even before any alert fires.
+
+  STEP 2 — Add detection logic in alert_monitor_node.py
+  ───────────────────────────────────────────────────────
+
+  Add your detection inside an existing subscription callback (e.g., _on_imu,
+  _on_odom) or create a new one. Pattern:
+
+    if <condition met>:
+        self._fire_alert(
+            idx,                    # robot index (int)
+            'YOUR_ALERT_TYPE',      # must match _ALERT_SEVERITIES key
+            'warning',              # or 'critical'
+            f'{ns}: description',   # human-readable, shown in AlertHistory
+            measured_value,         # float — displayed in the value column
+            threshold_value,        # float — the limit that was breached
+        )
+    else:
+        self._clear_alert(idx, 'YOUR_ALERT_TYPE')
+
+  If the type needs a threshold from .env, add it to __init__:
+
+    self.your_threshold = float(os.environ.get('ALERT_YOUR_THRESHOLD', '5.0'))
+
+  And document it in .env.example.
+
+  STEP 3 — Add to AlertType union in src/types/ros.ts
+  ──────────────────────────────────────────────────────
+
+  In the AlertType union (line ~165):
+
+    export type AlertType =
+      | 'COLLISION'
+      ...
+      | 'YOUR_ALERT_TYPE';   // add here
+
+  TypeScript will now type-check all alert_type references against the union.
+
+  STEP 4 — Add a formatMeasurement case in AlertHistory.tsx
+  ───────────────────────────────────────────────────────────
+
+  In the formatMeasurement function (src/components/dashboard/AlertHistory.tsx):
+
+    case 'YOUR_ALERT_TYPE': return `${value.toFixed(2)} unit / limit ${threshold.toFixed(2)} unit`;
+
+  Without this, the alert card's measurement line falls through to the default
+  formatter which still works but shows generic "value / threshold" labels.
+
+  STEP 5 (optional) — Add a Grafana alert rule
+  ──────────────────────────────────────────────
+
+  Append a new rule block to the robot-thresholds group in
+  monitoring/grafana/provisioning/alerting/alert_rules.yml:
+
+    - uid: robot-youralert-alert
+      title: Robot Your Alert
+      condition: threshold
+      for: 0s       # use 0s for safety-critical, 10s for operational
+      annotations:
+        summary: 'Robot {{ $labels.robot_id }}: your condition'
+        description: '{{ printf "%.2f" $values.A.Value }} units'
+      labels:
+        severity: warning
+        alert_type: YOUR_ALERT_TYPE
+      data:
+        - refId: A
+          datasourceUid: prometheus-ds
+          relativeTimeRange: { from: 30, to: 0 }
+          model:
+            expr: (your_prometheus_metric > scalar(your_threshold_gauge)) and on(robot_id) (robot_connection_status == 1)
+            refId: A
+        - refId: threshold
+          datasourceUid: '-100'
+          model:
+            conditions:
+              - evaluator: { params: [1], type: gt }
+                query: { params: [A] }
+                reducer: { type: last }
+                type: query
+            expression: A
+            refId: threshold
+            type: threshold
+      noDataState: OK
+      execErrState: Alerting
+
+  Then restart Grafana: docker compose restart grafana
+
+  STEP 6 (optional) — Expose a threshold gauge for Grafana sync
+  ──────────────────────────────────────────────────────────────
+
+  If the Grafana rule needs to stay in sync with a .env threshold, add a
+  scalar Gauge at module level in alert_monitor_node.py (alongside existing
+  _thresh_* gauges):
+
+    _thresh_your_gauge = Gauge('robot_your_threshold', 'Your threshold description')
+
+  Set it in main() after _node_up_gauge.set(1):
+
+    _thresh_your_gauge.set(node.your_threshold)
+
+  Use scalar(robot_your_threshold) in the Grafana rule expr instead of a
+  hardcoded literal. See section 3.2 for the rationale.
+
+  CHECKLIST SUMMARY
+    □ _ALERT_SEVERITIES entry added           (alert_monitor_node.py)
+    □ Detection logic + _fire_alert call      (alert_monitor_node.py)
+    □ _clear_alert call on else branch        (alert_monitor_node.py)
+    □ Threshold env var + .env.example doc    (if tunable)
+    □ AlertType union updated                 (src/types/ros.ts)
+    □ formatMeasurement case added            (AlertHistory.tsx)
+    □ Grafana alert rule added                (alert_rules.yml, optional)
+    □ Threshold gauge added                   (alert_monitor_node.py, if Grafana rule)
+    □ docker compose restart grafana          (if rule was added)
+
+================================================================================
+  14.  SECURITY CONSIDERATIONS
+================================================================================
+
+  The default stack is configured for local development only. The following
+  exposures must be addressed before deploying on any networked or shared
+  environment.
+
+  14.1  GRAFANA DEFAULT CREDENTIALS
+  ───────────────────────────────────
+  Default login is admin / admin. Anyone who can reach port 3001 can:
+    — Read all metrics and alert history
+    — Modify dashboards and alert rules
+    — Add or change contact point URLs (e.g. redirect alerts to attacker's server)
+    — Create API keys with admin access
+
+  Mitigation:
+    — Change GRAFANA_ADMIN_PASSWORD in .env before first boot
+    — Enable Grafana's built-in auth proxy or SSO (LDAP/OAuth) for team use
+    — Restrict port 3001 to localhost or an internal network via firewall rules
+
+  14.2  UNAUTHENTICATED ROSBRIDGE (port 9090)
+  ─────────────────────────────────────────────
+  rosbridge_websocket has no authentication by default. Any WebSocket client
+  that can reach port 9090 can:
+    — Subscribe to all sensor topics (LaserScan, camera, IMU, odometry)
+    — Publish to /tb3_i/cmd_vel and move robots arbitrarily
+    — Publish to /safety_auto_stop and disable the auto-stop feature
+    — Inject fabricated alerts onto /robot_alerts
+
+  Mitigation:
+    — Bind rosbridge to 127.0.0.1 only in docker-compose.yml (remove host
+      port binding or use 127.0.0.1:9090:9090)
+    — Enable rosbridge authentication: set authenticate: true and provide
+      a token in rosbridge_params.yaml
+    — Firewall port 9090 from any external interface
+
+  14.3  UNAUTHENTICATED PROMETHEUS (port 9091)
+  ──────────────────────────────────────────────
+  Prometheus has no authentication in its default configuration. Any host
+  that can reach port 9091 can:
+    — Query all robot metrics and alert counters
+    — Access the Prometheus admin API (if enabled) to delete time-series data
+
+  Mitigation:
+    — Bind Prometheus to localhost only in docker-compose.yml
+    — Deploy a reverse proxy (nginx, Caddy) with basic auth in front of :9091
+    — If admin API is not needed, ensure --web.enable-admin-api is NOT set
+
+  14.4  CMD_VEL PUBLISH AUTHORITY
+  ─────────────────────────────────
+  The Next.js dashboard publishes to /tb3_i/cmd_vel for teleoperation. In the
+  current architecture there is no command arbitration — any WebSocket client
+  can publish velocity commands and override the navigation stack. If multiple
+  operators share the dashboard simultaneously, command conflicts are possible.
+
+  Mitigation (for multi-operator deployments):
+    — Add a session-level robot lock before teleop becomes active
+    — Route cmd_vel through a priority mux node that enforces command authority
+
+  14.5  ALERT_HISTORY.JSON ON DISK
+  ─────────────────────────────────
+  Alert history is written to /data/alert_history.json inside the ros-stack
+  container, backed by the Docker volume alert-data. The file is not encrypted
+  and is readable by any process with access to the volume.
+
+  Mitigation: If alert data is considered sensitive (e.g., contains operational
+  patterns or locations), encrypt the volume at rest using Docker volume plugins
+  or host-level disk encryption.
+
+  14.6  SUMMARY — LOCAL DEV IS FINE, NETWORKED IS NOT
+  ──────────────────────────────────────────────────────
+
+  ┌─────────────────────────┬──────────────┬──────────────────────────────────┐
+  │ Exposure                │ Local only   │ Action needed for network deploy  │
+  ├─────────────────────────┼──────────────┼──────────────────────────────────┤
+  │ Grafana admin/admin     │ Acceptable   │ Change password in .env           │
+  │ Rosbridge unauthenticated│ Acceptable  │ Bind to 127.0.0.1, add token auth │
+  │ Prometheus unauthenticated│ Acceptable │ Bind to 127.0.0.1, add proxy auth │
+  │ cmd_vel open publish    │ Acceptable   │ Add command lock for multi-user   │
+  │ alert_history plaintext │ Acceptable   │ Encrypt volume if data is sensitive│
+  └─────────────────────────┴──────────────┴──────────────────────────────────┘
+
+================================================================================
+  15.  VERIFICATION AND SMOKE-TEST GUIDE
+================================================================================
+
+  Use this after first setup or after any significant configuration change to
+  confirm the full pipeline is functioning end-to-end.
+
+  15.1  STEP 1 — ALL SERVICES HEALTHY
+  ─────────────────────────────────────
+
+  Run:  docker compose ps
+
+  Expected output — all four services with Status "Up" and "(healthy)":
+    rosviz-ros         Up (healthy)    0.0.0.0:9090->9090/tcp
+    rosviz-dashboard   Up (healthy)    0.0.0.0:3000->3000/tcp
+    rosviz-prometheus  Up (healthy)    0.0.0.0:9091->9091/tcp
+    rosviz-grafana     Up (healthy)    0.0.0.0:3001->3001/tcp
+
+  If ros-stack is unhealthy: docker compose logs ros-stack | tail -50
+  The health check polls http://localhost:8888/metrics — if that endpoint is
+  absent, the alert_monitor_node has not started yet (allow 30s after boot).
+
+
+  15.2  STEP 2 — PROMETHEUS RECEIVING METRICS
+  ─────────────────────────────────────────────
+
+  Open: http://localhost:9091/targets
+
+  The ros-stack:8888 target must show:
+    State:      UP
+    Last scrape: < 10 seconds ago
+    Error:      (empty)
+
+  Then run these queries at http://localhost:9091 (Graph tab):
+
+    a. robot_connection_status
+       → Should return one series per robot, all with value 1.
+         If empty: Prometheus cannot reach ros-stack:8888. Check Docker network.
+
+    b. robot_alert_node_up
+       → Should return value 1.
+         If 0 or absent: alert_monitor_node exited. Check: docker compose logs ros-stack
+
+    c. increase(robot_alert_node_heartbeat[30s])
+       → Should return a value >= 1 (counter is incrementing every 5s).
+         If 0 or absent: heartbeat thread is dead. Restart ros-stack.
+
+    d. robot_vel_linear_max
+       → Should return your ALERT_VEL_LINEAR_MAX value (default 0.5).
+         Confirms threshold gauges are being set at node startup.
+
+    e. floor(sum by (alert_type)(increase(robot_alert_total[5m])))
+       → Should return 12 rows, all with value 0 on a fresh start.
+         If fewer than 12 rows: counter pre-seeding failed. Restart ros-stack.
+
+
+  15.3  STEP 3 — DASHBOARD CONNECTING
+  ──────────────────────────────────────
+
+  Open: http://localhost:3000
+
+  In the AlertHistory panel (right column):
+    □ The dot next to "Alert History" is green and pulsing.
+    □ "Crit(0)(0) Warn(0)(0)" is shown in the header (no alerts yet).
+    □ The alert list shows "No alerts".
+
+  If the dot is red: rosbridge is unreachable. Check ros-stack is running and
+  port 9090 is mapped. Open browser devtools → Console for WebSocket errors.
+
+
+  15.4  STEP 4 — GRAFANA DASHBOARD LOADING
+  ──────────────────────────────────────────
+
+  Open: http://localhost:3001  (admin / admin)
+  Navigate: Dashboards → Robot Monitoring → Robot Alert Monitor
+
+  □ The "robot_id" variable dropdown is visible at the top.
+    Click it — options should include "All", "0", "1", "2".
+    If empty: robot_connection_status has no data. Go back to step 2.
+
+  □ Panel 8 (Connection Status) shows green for all robots.
+  □ Panel 3 (Battery %) shows three distinct lines starting near 95/90/85%.
+  □ Panel 17 (Alert Monitor Node Status) shows "UP" with a green background.
+
+  If any panel shows "No data": check the time range (top right). Set to
+  "Last 5 minutes". If still empty, Prometheus is not scraping — see step 2.
+
+
+  15.5  STEP 5 — TRIGGER A TEST ALERT END-TO-END
+  ─────────────────────────────────────────────────
+
+  The easiest alert to trigger manually is CONNECTION_LOSS. Stop the
+  ros-stack container (which cuts all sensor topic traffic):
+
+    docker compose stop ros-stack
+
+  Wait 6 seconds (ALERT_CONN_TIMEOUT_S default is 5s).
+
+  Expected results:
+    Dashboard (http://localhost:3000):
+      □ The AlertHistory connection dot turns red (rosbridge stopped).
+
+  Restart ros-stack to reconnect:
+    docker compose start ros-stack
+
+  Wait ~15 seconds for the node to reinitialise and Gazebo to resume.
+
+  Expected results after reconnect:
+    Dashboard:
+      □ Connection dot turns green.
+      □ AlertHistory immediately populates with CONNECTION_LOSS alerts for
+        all robots (on-demand history request fired on reconnect).
+      □ Header shows "Crit(N)(N)" — unacknowledged critical alerts.
+      □ The panel border flashes red for 2 seconds.
+
+    Prometheus (http://localhost:9091):
+      □ Query: robot_alert_total{alert_type="CONNECTION_LOSS"}
+        Returns counts > 0 for each robot.
+
+    Grafana (http://localhost:3001):
+      □ Panel 8 (Connection Status) briefly showed red; now green again.
+      □ Panel 4 (Alerts by Type) shows CONNECTION_LOSS count > 0.
+      □ Alerting → Alert rules → robot-connection-alert:
+        State should now be Normal (was Firing during the outage).
+
+
+  15.6  STEP 6 — VERIFY ALERT RULES ARE EVALUATING
+  ──────────────────────────────────────────────────
+
+  In Grafana: Alerting → Alert rules → robot-thresholds group
+
+  All rules should be in "Normal" state during nominal operation.
+  If any rule shows "Error": click it to view the PromQL eval error.
+  Common cause: datasource UID mismatch. Verify prometheus-ds uid in
+  monitoring/grafana/provisioning/datasources/prometheus.yml matches
+  the uid used in alert_rules.yml data blocks (should both be "prometheus-ds").
+
+  To test a rule fires correctly without physical conditions:
+    Left sidebar → Alerting → Alert rules → (rule) → Edit → Preview
+    The Preview tab runs the PromQL query immediately and shows whether the
+    threshold condition is met. Use this to validate a rule before deploying
+    it to a real robot fleet.
+
+
+  15.7  EXPECTED STEADY-STATE METRICS
+  ──────────────────────────────────────
+
+  After 5+ minutes of nominal operation with no faults, these values
+  indicate a fully healthy system:
+
+  ┌─────────────────────────────────────┬────────────────────────────────────┐
+  │ Metric / Check                       │ Expected value                     │
+  ├─────────────────────────────────────┼────────────────────────────────────┤
+  │ robot_connection_status{robot_id}    │ 1 for all robots                   │
+  │ robot_alert_node_up                  │ 1                                  │
+  │ increase(heartbeat[30s])             │ >= 1 (typically 5-6)               │
+  │ robot_alert_node_heartbeat (counter) │ Increasing monotonically           │
+  │ robot_battery_percentage{robot_id=0} │ ~95% minus elapsed drain           │
+  │ robot_min_scan_range                 │ > robot_collision_threshold        │
+  │ robot_motor_stall_status             │ 0 for all robots                   │
+  │ robot_geofence_status                │ 0 for all robots                   │
+  │ Grafana all alert rules              │ Normal                             │
+  │ AlertHistory connection dot          │ Green, pulsing                     │
+  │ Alert count (Panel 4, last 5m)       │ 0 across all types                 │
+  └─────────────────────────────────────┴────────────────────────────────────┘
+
+================================================================================
+  END OF DOCUMENT
+================================================================================

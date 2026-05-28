@@ -1,80 +1,70 @@
-'use client';
+"use client";
 
-import { Suspense, useEffect, useRef, useState } from 'react';
-import dynamic from 'next/dynamic';
-import Split from 'split.js';
-import { usePathname, useRouter } from 'next/navigation';
+import { Suspense, useEffect, useRef, useState } from "react";
+import dynamic from "next/dynamic";
+import Split from "split.js";
+import { usePathname, useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
-import { 
-  Grid,
-  Plus,
-  Minus,
-  Activity,
-  ExternalLink,
-  ChevronLeft
-} from 'lucide-react';
-import Link from 'next/link';
+import { Grid, Plus, Minus, Activity, ExternalLink, ChevronLeft } from "lucide-react";
+import Link from "next/link";
 
 import RobotSelector from "@/components/ui/RobotSelector";
 import { useDiscoveredRobots } from "@/hooks/useDiscoveredRobots";
 import { useRobotSelection } from "@/hooks/useRobotSelection";
 import { useROS } from "@/hooks/useROS";
 
-const TelemetryPanel = dynamic(
-  () => import('./TelemetryPanel'),
-  {
-    loading: () => (
-      <div className="h-full bg-[#1a1a1a] rounded-sm p-2 border border-[#2a2a2a] flex items-center justify-center">
-        <span className="text-gray-400">Loading Telemetry...</span>
-      </div>
-    ),
-    ssr: false
-  }
-);
+const TelemetryPanel = dynamic(() => import("./TelemetryPanel"), {
+  loading: () => (
+    <div className="h-full bg-[#1a1a1a] rounded-sm p-2 border border-[#2a2a2a] flex items-center justify-center">
+      <span className="text-gray-400">Loading Telemetry...</span>
+    </div>
+  ),
+  ssr: false,
+});
 
-const VideoGrid = dynamic(
-  () => import('./VideoGrid'),
-  {
-    loading: () => (
-      <div className="h-full bg-[#1e1e1e] rounded-sm p-2 border border-[#333333] flex items-center justify-center">
-        <span className="text-gray-400">Loading Video Grid...</span>
-      </div>
-    ),
-    ssr: false
-  }
-);
+const VideoGrid = dynamic(() => import("./VideoGrid"), {
+  loading: () => (
+    <div className="h-full bg-[#1e1e1e] rounded-sm p-2 border border-[#333333] flex items-center justify-center">
+      <span className="text-gray-400">Loading Video Grid...</span>
+    </div>
+  ),
+  ssr: false,
+});
 
-const Controls = dynamic(
-  () => import('./Controls'),
-  {
-    loading: () => (
-      <div className="h-full bg-[#1e1e1e] rounded-sm p-2 border border-[#333333] flex items-center justify-center">
-        <span className="text-gray-400">Loading Controls...</span>
-      </div>
-    ),
-    ssr: false
-  }
-);
+const Controls = dynamic(() => import("./Controls"), {
+  loading: () => (
+    <div className="h-full bg-[#1e1e1e] rounded-sm p-2 border border-[#333333] flex items-center justify-center">
+      <span className="text-gray-400">Loading Controls...</span>
+    </div>
+  ),
+  ssr: false,
+});
 
-const SensorData = dynamic(
-  () => import('./SensorData'),
-  {
-    loading: () => (
-      <div className="h-full bg-[#1e1e1e] rounded-sm p-2 border border-[#333333] flex items-center justify-center">
-        <span className="text-gray-400">Loading Sensor Data...</span>
-      </div>
-    ),
-    ssr: false
-  }
-);
+const SensorData = dynamic(() => import("./SensorData"), {
+  loading: () => (
+    <div className="h-full bg-[#1e1e1e] rounded-sm p-2 border border-[#333333] flex items-center justify-center">
+      <span className="text-gray-400">Loading Sensor Data...</span>
+    </div>
+  ),
+  ssr: false,
+});
+
+const AlertHistory = dynamic(() => import("./AlertHistory"), {
+  loading: () => (
+    <div className="h-full bg-[#1a1a1a] rounded-sm p-2 border border-[#2a2a2a] flex items-center justify-center">
+      <span className="text-gray-400">Loading Alerts...</span>
+    </div>
+  ),
+  ssr: false,
+});
 
 export default function DashboardClient() {
   const mainSplitRef = useRef(null);
   const leftSplitRef = useRef(null);
-  const [activeTab, setActiveTab] = useState('dashboard');
+  const rightSplitRef = useRef(null);
+  const [activeTab, setActiveTab] = useState("dashboard");
   const router = useRouter();
   const pathname = usePathname();
-
 
   const { isConnected } = useROS();
   const robots = useDiscoveredRobots();
@@ -82,7 +72,7 @@ export default function DashboardClient() {
   const hasRobot = selectedRobotId !== null;
 
   const handleRobotSelect = (id: number) => {
-    if (pathname.startsWith('/robot/')) {
+    if (pathname.startsWith("/robot/")) {
       router.push(`/robot/tb3_${id}`);
       return;
     }
@@ -101,33 +91,49 @@ export default function DashboardClient() {
   useEffect(() => {
     let mainSplit: Split.Instance;
     let leftSplit: Split.Instance;
+    let rightSplit: Split.Instance;
 
-    if (activeTab === 'dashboard' && mainSplitRef.current && leftSplitRef.current) {
+    if (activeTab === "dashboard" && mainSplitRef.current && leftSplitRef.current) {
       // Initialize main horizontal split
-      mainSplit = Split(['.left-panel', '.right-panel'], {
+      mainSplit = Split([".left-panel", ".right-panel"], {
         sizes: [66, 34],
         minSize: [500, 300],
         gutterSize: 4,
         snapOffset: 0,
         dragInterval: 1,
-        cursor: 'col-resize',
+        cursor: "col-resize",
         gutter: (index, direction) => {
-          const gutter = document.createElement('div');
+          const gutter = document.createElement("div");
           gutter.className = `gutter gutter-${direction} bg-[#232323] hover:bg-[#00a5ff] transition-colors duration-150`;
           return gutter;
         },
       });
 
       // Initialize left vertical split
-      leftSplit = Split(['.left-top', '.left-bottom'], {
+      leftSplit = Split([".left-top", ".left-bottom"], {
         sizes: [67, 33],
         minSize: [200, 200],
-        direction: 'vertical',
+        direction: "vertical",
         gutterSize: 4,
         snapOffset: 0,
-        cursor: 'row-resize',
+        cursor: "row-resize",
         gutter: (index, direction) => {
-          const gutter = document.createElement('div');
+          const gutter = document.createElement("div");
+          gutter.className = `gutter gutter-${direction} bg-[#232323] hover:bg-[#00a5ff] transition-colors duration-150`;
+          return gutter;
+        },
+      });
+
+      // Initialize right vertical split (Controls top, AlertHistory bottom)
+      rightSplit = Split([".right-top", ".right-bottom"], {
+        sizes: [60, 40],
+        minSize: [200, 150],
+        direction: "vertical",
+        gutterSize: 4,
+        snapOffset: 0,
+        cursor: "row-resize",
+        gutter: (index, direction) => {
+          const gutter = document.createElement("div");
           gutter.className = `gutter gutter-${direction} bg-[#232323] hover:bg-[#00a5ff] transition-colors duration-150`;
           return gutter;
         },
@@ -137,6 +143,7 @@ export default function DashboardClient() {
     return () => {
       mainSplit?.destroy();
       leftSplit?.destroy();
+      rightSplit?.destroy();
     };
   }, [activeTab, hasRobot]);
 
@@ -146,38 +153,42 @@ export default function DashboardClient() {
       <div className="w-full h-12 bg-[#232323] flex items-center px-2 gap-1 border-b border-[#333333]">
         <div className="flex items-center gap-1">
           <Link href="/">
-            <Button variant="ghost" size="sm" className="h-8 px-3 text-gray-400 hover:text-white hover:bg-[#2a2a2a]">
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-8 px-3 text-gray-400 hover:text-white hover:bg-[#2a2a2a]"
+            >
               <ChevronLeft className="w-4 h-4 mr-2" />
               Fleet Overview
             </Button>
           </Link>
           <span className="text-gray-600 mx-2">|</span>
-          <Button 
-            variant="ghost" 
+          <Button
+            variant="ghost"
             size="sm"
             className={`h-8 px-3 text-gray-400 hover:text-white hover:bg-[#2a2a2a] ${
-              activeTab === 'dashboard' ? 'bg-[#2a2a2a] text-white' : ''
+              activeTab === "dashboard" ? "bg-[#2a2a2a] text-white" : ""
             }`}
-            onClick={() => setActiveTab('dashboard')}
+            onClick={() => setActiveTab("dashboard")}
           >
             <Grid className="w-4 h-4 mr-2" />
             Dashboard
           </Button>
-          <Button 
-            variant="ghost" 
+          <Button
+            variant="ghost"
             size="sm"
             className={`h-8 px-3 text-gray-400 hover:text-white hover:bg-[#2a2a2a] ${
-              activeTab === 'sensor-data' ? 'bg-[#2a2a2a] text-white' : ''
+              activeTab === "sensor-data" ? "bg-[#2a2a2a] text-white" : ""
             }`}
-            onClick={() => setActiveTab('sensor-data')}
+            onClick={() => setActiveTab("sensor-data")}
           >
             <Activity className="w-4 h-4 mr-2" />
             Sensor Data
           </Button>
-          
+
           <Link href="/sensor-data" target="_blank" passHref>
-            <Button 
-              variant="ghost" 
+            <Button
+              variant="ghost"
               size="sm"
               className="h-8 px-3 text-gray-400 hover:text-white hover:bg-[#2a2a2a]"
             >
@@ -185,74 +196,95 @@ export default function DashboardClient() {
               Open Sensors in New Tab
             </Button>
           </Link>
-          
+
           <span className="text-gray-600 mx-2">|</span>
-          <Button variant="ghost" size="icon" className="h-8 w-8 text-gray-400 hover:text-white hover:bg-[#2a2a2a]">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-8 w-8 text-gray-400 hover:text-white hover:bg-[#2a2a2a]"
+          >
             <Plus className="w-4 h-4" />
           </Button>
-          <Button variant="ghost" size="icon" className="h-8 w-8 text-gray-400 hover:text-white hover:bg-[#2a2a2a]">
+          <Button
+            variant="ghost"
+            size="icon"
+            className="h-8 w-8 text-gray-400 hover:text-white hover:bg-[#2a2a2a]"
+          >
             <Minus className="w-4 h-4" />
           </Button>
         </div>
         <div className="flex-1" />
-          <RobotSelector
-            robots={robots}
-            selectedRobotId={selectedRobotId}
-            onSelect={handleRobotSelect}
-            isConnected={isConnected}
-          />
-          <span className="text-gray-600 mx-2">|</span>
-          <span className="text-gray-400 text-sm">TurtleBot3 Control System</span>
-        </div>
+        <RobotSelector
+          robots={robots}
+          selectedRobotId={selectedRobotId}
+          onSelect={handleRobotSelect}
+          isConnected={isConnected}
+        />
+        <span className="text-gray-600 mx-2">|</span>
+        <span className="text-gray-400 text-sm">TurtleBot3 Control System</span>
+      </div>
 
       {/* Main Content */}
       {!hasRobot ? (
         <div className="h-[calc(100vh-3.1rem)] flex items-center justify-center bg-[#1a1a1a] text-gray-400">
-          {isConnected ? 'Waiting for robots…' : 'Connecting to ROS…'}
+          {isConnected ? "Waiting for robots…" : "Connecting to ROS…"}
         </div>
-      ) : activeTab === 'dashboard' ? (
+      ) : activeTab === "dashboard" ? (
         <div className="h-[calc(100vh-4.1rem)] p-1 flex" ref={mainSplitRef}>
           {/* Left Panel */}
           <div className="left-panel flex flex-col h-full" ref={leftSplitRef}>
             <div className="left-top">
-              <Suspense fallback={
-                <div className="h-full bg-[#1e1e1e] rounded-sm flex items-center justify-center">
-                  <span className="text-gray-400">Loading...</span>
-                </div>
-              }>
+              <Suspense
+                fallback={
+                  <div className="h-full bg-[#1e1e1e] rounded-sm flex items-center justify-center">
+                    <span className="text-gray-400">Loading...</span>
+                  </div>
+                }
+              >
                 <VideoGrid key={selectedRobotId} robotId={selectedRobotId} />
               </Suspense>
             </div>
-            
+
             <div className="left-bottom">
-              <Suspense fallback={
-                <div className="h-full bg-[#1a1a1a] rounded-sm flex items-center justify-center">
-                  <span className="text-gray-400">Loading...</span>
-                </div>
-              }>
+              <Suspense
+                fallback={
+                  <div className="h-full bg-[#1a1a1a] rounded-sm flex items-center justify-center">
+                    <span className="text-gray-400">Loading...</span>
+                  </div>
+                }
+              >
                 <TelemetryPanel key={selectedRobotId} robotId={selectedRobotId} />
               </Suspense>
             </div>
           </div>
 
-          {/* Right Panel - Full Controls */}
-          <div className="right-panel h-full">
-            <Suspense fallback={
-              <div className="h-full bg-[#1e1e1e] rounded-sm flex items-center justify-center">
-                <span className="text-gray-400">Loading Controls...</span>
-              </div>
-            }>
-              <Controls key={selectedRobotId} robotId={selectedRobotId} />
-            </Suspense>
+          {/* Right Panel - Controls (top) + Alert History (bottom) */}
+          <div className="right-panel h-full flex flex-col" ref={rightSplitRef}>
+            <div className="right-top">
+              <Suspense
+                fallback={
+                  <div className="h-full bg-[#1e1e1e] rounded-sm flex items-center justify-center">
+                    <span className="text-gray-400">Loading Controls...</span>
+                  </div>
+                }
+              >
+                <Controls key={`robot-${selectedRobotId}`} robotId={selectedRobotId} />
+              </Suspense>
+            </div>
+            <div className="right-bottom">
+              <AlertHistory />
+            </div>
           </div>
         </div>
       ) : (
-        <Suspense fallback={
-          <div className="h-[calc(100vh-3.1rem)] bg-[#1e1e1e] flex items-center justify-center">
-            <span className="text-gray-400">Loading Sensor Data...</span>
-          </div>
-        }>
-          <SensorData key={selectedRobotId} robotId={selectedRobotId}/>
+        <Suspense
+          fallback={
+            <div className="h-[calc(100vh-3.1rem)] bg-[#1e1e1e] flex items-center justify-center">
+              <span className="text-gray-400">Loading Sensor Data...</span>
+            </div>
+          }
+        >
+          <SensorData key={selectedRobotId} robotId={selectedRobotId} />
         </Suspense>
       )}
     </div>

@@ -1,0 +1,10 @@
+groups:
+  - name: prometheus-self
+    rules:
+      - alert: RosStackMetricsDown
+        expr: up{job="robot_alert_monitor"} == 0
+        for: 15s
+        labels:
+          severity: critical
+        annotations:
+          summary: "ros-stack Prometheus metrics endpoint unreachable"

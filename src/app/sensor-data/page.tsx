@@ -1,23 +1,20 @@
-'use client';
+"use client";
 
-import React, { Suspense, useEffect } from 'react';
-import dynamic from 'next/dynamic';
-import RobotSelector from '@/components/ui/RobotSelector';
-import { useDiscoveredRobots } from '@/hooks/useDiscoveredRobots';
-import { useRobotSelection } from '@/hooks/useRobotSelection';
-import { useROS } from '@/hooks/useROS';
+import React, { Suspense, useEffect } from "react";
+import dynamic from "next/dynamic";
+import RobotSelector from "@/components/ui/RobotSelector";
+import { useDiscoveredRobots } from "@/hooks/useDiscoveredRobots";
+import { useRobotSelection } from "@/hooks/useRobotSelection";
+import { useROS } from "@/hooks/useROS";
 
-const SensorData = dynamic(
-  () => import('@/components/dashboard/SensorData'),
-  {
-    loading: () => (
-      <div className="h-screen w-screen flex items-center justify-center bg-[#1a1a1a] text-gray-400">
-        Loading Sensor Data...
-      </div>
-    ),
-    ssr: false
-  }
-);
+const SensorData = dynamic(() => import("@/components/dashboard/SensorData"), {
+  loading: () => (
+    <div className="h-screen w-screen flex items-center justify-center bg-[#1a1a1a] text-gray-400">
+      Loading Sensor Data...
+    </div>
+  ),
+  ssr: false,
+});
 
 export default function SensorDataPage() {
   const { isConnected } = useROS();
@@ -48,15 +45,17 @@ export default function SensorDataPage() {
 
       {selectedRobotId === null ? (
         <div className="h-[calc(100vh-3rem)] flex items-center justify-center bg-[#1a1a1a] text-gray-400">
-          {isConnected ? 'Waiting for robots…' : 'Connecting to ROS…'}
+          {isConnected ? "Waiting for robots…" : "Connecting to ROS…"}
         </div>
       ) : (
-        <Suspense fallback={
-          <div className="h-[calc(100vh-3rem)] flex items-center justify-center bg-[#1a1a1a] text-gray-400">
-            Loading...
-          </div>
-        }>
-          <SensorData key={selectedRobotId} robotId={selectedRobotId} />
+        <Suspense
+          fallback={
+            <div className="h-[calc(100vh-3rem)] flex items-center justify-center bg-[#1a1a1a] text-gray-400">
+              Loading...
+            </div>
+          }
+        >
+          <SensorData key={`robot-${selectedRobotId}`} robotId={selectedRobotId} />
         </Suspense>
       )}
     </div>

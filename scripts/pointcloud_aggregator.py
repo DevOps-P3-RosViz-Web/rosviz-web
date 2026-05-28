@@ -179,7 +179,7 @@ class PointCloudAggregator(Node):
         return age_ns > int(self.stale_timeout_sec * 1e9)
 
     def _lookup_transform(self, source_frame: str, stamp: Time) -> Optional[
-        tf2_ros.TransformStamped]:
+            tf2_ros.TransformStamped]:
 
         try:
             return self.tf_buffer.lookup_transform(
@@ -195,7 +195,7 @@ class PointCloudAggregator(Node):
             return None
 
     def _transform_cloud_to_target(self, msg: PointCloud2) -> Optional[
-        PointCloud2]:
+            PointCloud2]:
 
         source_frame = msg.header.frame_id
 
@@ -271,7 +271,7 @@ class PointCloudAggregator(Node):
 
         try:
             frames = self.tf_buffer.all_frames_as_string()
-            self.get_logger().info(f"[tf] known frames:\n{frames}")
+            # self.get_logger().info(f"[tf] known frames:\n{frames}")
         except Exception as exc:
             self.get_logger().warn(f"[tf] could not list frames: {exc}")
 
