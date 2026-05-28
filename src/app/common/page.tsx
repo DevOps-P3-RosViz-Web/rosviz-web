@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { Grid, Eye, AlertTriangle, AlertCircle } from "lucide-react";
+import { Grid, Eye } from "lucide-react";
 import dynamic from "next/dynamic";
 import { useState, useEffect } from "react";
 import { useDiscoveredRobots } from "@/hooks/useDiscoveredRobots";
@@ -12,17 +12,14 @@ const MapView = dynamic(() => import("@/components/dashboard/MapView"), { ssr: f
 const PointCloud = dynamic(() => import("@/components/dashboard/sensor-components/PointCloud"), {
   ssr: false,
 });
+const AlertHistory = dynamic(() => import("@/components/dashboard/AlertHistory"), {
+  ssr: false,
+});
 
 function getRobotColor(id: number): string {
   const hue = (id * 137.5) % 360;
   return `hsl(${hue}, 80%, 55%)`;
 }
-
-const alerts = [
-  { ts: "09.04.2026 15:55", text: "Possible Collision Detected", variant: "critical" },
-  { ts: "09.04.2026 12:55", text: "Velocity Alert", variant: "warning" },
-  { ts: "09.04.2026 07:34", text: "Velocity Alert", variant: "warning" },
-];
 
 export default function CommonPage() {
   const { isConnected } = useROS();
@@ -139,28 +136,8 @@ export default function CommonPage() {
         </div>
 
         {/* Alerts Row */}
-        <div className="bg-[#1e1e1e] rounded-sm border border-[#333333] p-2 shrink-0">
-          <span className="text-[#00a5ff] text-sm font-semibold">Alert History</span>
-          <div className="mt-2 flex flex-col gap-1">
-            {alerts.map((alert, i) => (
-              <div
-                key={i}
-                className={`flex items-center gap-3 px-2.5 py-1.5 rounded border text-xs ${
-                  alert.variant === "critical"
-                    ? "border-red-500/40 bg-red-500/10 text-red-400"
-                    : "border-yellow-500/40 bg-yellow-500/10 text-yellow-400"
-                }`}
-              >
-                {alert.variant === "critical" ? (
-                  <AlertCircle className="w-3.5 h-3.5 shrink-0" />
-                ) : (
-                  <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
-                )}
-                <span className="font-mono text-[10px] opacity-70 shrink-0">{alert.ts}</span>
-                <span>{alert.text}</span>
-              </div>
-            ))}
-          </div>
+        <div className="shrink-0 h-56 min-h-0 overflow-hidden">
+          <AlertHistory />
         </div>
       </div>
     </div>
